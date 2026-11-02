@@ -43,6 +43,15 @@ func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, log *slog.Logger) http
 		writeJSON(w, http.StatusOK, robot)
 	})
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
+		if s := r.URL.Query().Get("since"); s != "" {
+			seq, err := strconv.ParseUint(s, 10, 64)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "since must be an event seq"})
+				return
+			}
+			writeJSON(w, http.StatusOK, hub.Since(seq))
+			return
+		}
 		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
 		writeJSON(w, http.StatusOK, hub.Recent(n))
 	})

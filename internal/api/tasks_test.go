@@ -83,7 +83,8 @@ func TestPostTask(t *testing.T) {
 
 func TestGetTasks(t *testing.T) {
 	srv, m, g := newTaskServer(t)
-	g.ApplyState("r1", fleet.StateMsg{Boot: "b", Seq: 1, Mode: "IDLE", Battery: 90})
+	g.ApplyPose("r1", fleet.PoseMsg{Boot: "b", Seq: 1})
+	g.ApplyState("r1", fleet.StateMsg{Boot: "b", Seq: 1, Mode: "IDLE", Battery: ptr(90.0)})
 	for range 3 {
 		post(t, srv.URL+"/tasks", `{"waypoints":[{"x":1,"y":1,"floor":0}]}`, nil)
 	}
@@ -118,7 +119,8 @@ func TestGetTasks(t *testing.T) {
 
 func TestCancelTask(t *testing.T) {
 	srv, m, g := newTaskServer(t)
-	g.ApplyState("r1", fleet.StateMsg{Boot: "b", Seq: 1, Mode: "IDLE", Battery: 90})
+	g.ApplyPose("r1", fleet.PoseMsg{Boot: "b", Seq: 1})
+	g.ApplyState("r1", fleet.StateMsg{Boot: "b", Seq: 1, Mode: "IDLE", Battery: ptr(90.0)})
 	post(t, srv.URL+"/tasks", `{"waypoints":[{"x":1,"y":1,"floor":0}]}`, nil)
 	post(t, srv.URL+"/tasks", `{"waypoints":[{"x":1,"y":1,"floor":0}]}`, nil)
 	m.Tick()

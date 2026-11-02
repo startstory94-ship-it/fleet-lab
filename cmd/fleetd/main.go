@@ -90,7 +90,7 @@ func main() {
 			if e.Detail != "" {
 				detail += ": " + e.Detail
 			}
-			publish(fleet.Event{Time: e.Time, Robot: e.Robot, Type: "task", Task: e.Task,
+			publish(fleet.Event{Time: e.Time, Robot: e.Robot, Type: e.Type, Task: e.Task,
 				From: e.From, To: e.To, Detail: detail})
 		},
 	})

@@ -91,7 +91,7 @@ func (h *harness) addRobot(r fleet.Robot) {
 }
 
 func idle(name string, x, y float64) fleet.Robot {
-	return fleet.Robot{Name: name, Conn: fleet.Online, Mode: "IDLE", Battery: 80, Floor: 1, X: x, Y: y}
+	return fleet.Robot{Name: name, Conn: fleet.Online, Mode: "IDLE", Battery: 80, BatteryKnown: true, HasPose: true, Floor: 1, X: x, Y: y}
 }
 
 func (h *harness) robot(name string) *fleet.Robot { return h.robots.robots[name] }
@@ -160,9 +160,7 @@ func (h *harness) start(robot string, wps ...Waypoint) Task {
 }
 
 func TestEligibility(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.MinBattery = 25
-	m := NewManager(cfg, Deps{})
+	m := NewManager(DefaultConfig(), Deps{})
 	base := idle("r1", 0, 0)
 	for _, tc := range []struct {
 		name   string
@@ -178,8 +176,8 @@ func TestEligibility(t *testing.T) {
 		{"CHARGING", func(r *fleet.Robot) { r.Mode = "CHARGING" }, false, false},
 		{"mode ERROR", func(r *fleet.Robot) { r.Mode = "ERROR" }, false, false},
 		{"error set while IDLE", func(r *fleet.Robot) { r.Error = "bumper" }, false, false},
-		{"battery below minimum", func(r *fleet.Robot) { r.Battery = 24.9 }, false, false},
-		{"battery at minimum", func(r *fleet.Robot) { r.Battery = 25 }, false, true},
+		{"battery below LowBattery", func(r *fleet.Robot) { r.Battery = 24.9 }, false, false},
+		{"battery at LowBattery", func(r *fleet.Robot) { r.Battery = 25 }, false, true},
 		{"reports a task", func(r *fleet.Robot) { r.TaskID = "t-9.0.1" }, false, false},
 		{"holds another task", func(*fleet.Robot) {}, true, false},
 	} {

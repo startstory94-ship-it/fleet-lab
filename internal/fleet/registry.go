@@ -23,14 +23,14 @@ type PoseMsg struct {
 
 // StateMsg is the payload of fleet/<robot>/state.
 type StateMsg struct {
-	Boot    string  `json:"boot"`
-	Seq     uint64  `json:"seq"`
-	Stamp   float64 `json:"stamp"`
-	Host    string  `json:"host"`
-	Mode    string  `json:"mode"`
-	Battery float64 `json:"battery"`
-	TaskID  string  `json:"task_id"`
-	Error   string  `json:"error"`
+	Boot    string   `json:"boot"`
+	Seq     uint64   `json:"seq"`
+	Stamp   float64  `json:"stamp"`
+	Host    string   `json:"host"`
+	Mode    string   `json:"mode"`
+	Battery *float64 `json:"battery"` // %; null or missing when the robot does not know
+	TaskID  string   `json:"task_id"`
+	Error   string   `json:"error"`
 
 	// SilenceS announces a planned blackout (e.g. riding an elevator) of up to
 	// this many seconds, counted from when the server receives the message.
@@ -52,7 +52,7 @@ type Event struct {
 	Seq    uint64    `json:"seq"`
 	Time   time.Time `json:"time"`
 	Robot  string    `json:"robot"`
-	Type   string    `json:"type"` // seen, conn, mode, error, elevator_overdue, adapter, task
+	Type   string    `json:"type"` // seen, conn, mode, error, elevator_overdue, adapter, task, battery
 	Task   string    `json:"task,omitempty"`
 	From   string    `json:"from,omitempty"`
 	To     string    `json:"to,omitempty"`
@@ -85,6 +85,12 @@ type Robot struct {
 	Battery float64 `json:"battery"`
 	TaskID  string  `json:"task_id"`
 	Error   string  `json:"error"`
+	// HasPose is set by the first pose. Before it, Floor, X and Y are zero
+	// values, not a position.
+	HasPose bool `json:"has_pose"`
+	// BatteryKnown is false when the last state carried no battery; Battery
+	// is then 0 and means nothing.
+	BatteryKnown bool `json:"battery_known"`
 
 	// LastSeen is when the server last accepted any message from this robot.
 	// It uses the server clock, so robot clock skew cannot affect liveness.
@@ -187,7 +193,7 @@ func (g *Registry) ApplyPose(name string, m PoseMsg) bool {
 	if m.Host != "" {
 		r.Host = m.Host
 	}
-	r.Frame, r.Floor = m.Frame, m.Floor
+	r.Frame, r.Floor, r.HasPose = m.Frame, m.Floor, true
 	r.X, r.Y, r.Yaw, r.V = m.X, m.Y, m.Yaw, m.V
 	g.flush(g.heard(r, now, evs))
 	return true
@@ -213,7 +219,11 @@ func (g *Registry) ApplyState(name string, m StateMsg) bool {
 	if m.Host != "" {
 		r.Host = m.Host
 	}
-	r.Mode, r.Battery, r.TaskID, r.Error = m.Mode, m.Battery, m.TaskID, m.Error
+	r.Mode, r.TaskID, r.Error = m.Mode, m.TaskID, m.Error
+	r.Battery, r.BatteryKnown = 0, m.Battery != nil
+	if m.Battery != nil {
+		r.Battery = *m.Battery
+	}
 	if m.SilenceS > 0 {
 		r.LastSeen = now
 		r.okStreak = 0

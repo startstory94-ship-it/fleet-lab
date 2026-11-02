@@ -44,9 +44,9 @@ IDLE, MOVING, DOCKING, CHARGING, ERROR = "IDLE", "MOVING", "DOCKING", "CHARGING"
 
 TICK = 0.1              # s, motion update period
 ARRIVE_TOL = 0.05       # m
-DRAIN_PER_M = 0.05      # % battery per metre driven
+DRAIN_PER_M = 0.05      # % battery per metre driven (default of --drain-per-m)
 DRAIN_IDLE = 0.002      # % per second while powered on
-CHARGE_RATE = 1.0       # % per second on the dock
+CHARGE_RATE = 1.0       # % per second on the dock (default of --charge-rate)
 
 
 def yaw_to_quat(yaw):
@@ -59,13 +59,15 @@ def quat_to_yaw(q):
 
 class MockRobot(Node):
     def __init__(self, name, x, y, speed, battery, fault_rate, drop_seconds,
-                 roam_rate=0.0, roam_max=4.0):
+                 roam_rate=0.0, roam_max=4.0, drain_per_m=DRAIN_PER_M, charge_rate=CHARGE_RATE):
         super().__init__("mock_robot", namespace=name)
         self.name = name
         self.x, self.y, self.yaw = x, y, 0.0
         self.dock = (x, y)
         self.speed = speed
         self.battery = battery
+        self.drain_per_m = drain_per_m
+        self.charge_rate = charge_rate
         self.fault_rate = fault_rate          # faults per minute (Poisson)
         self.drop_seconds = drop_seconds
         self.roam_rate = roam_rate            # Wi-Fi roaming gaps per minute (Poisson)
@@ -143,7 +145,7 @@ class MockRobot(Node):
         self.battery = max(0.0, self.battery - DRAIN_IDLE * TICK)
 
         if self.mode == CHARGING:
-            self.battery = min(100.0, self.battery + CHARGE_RATE * TICK)
+            self.battery = min(100.0, self.battery + self.charge_rate * TICK)
             if self.battery >= 100.0:
                 self.mode = IDLE
         elif self.mode in (MOVING, DOCKING) and self.goal:
@@ -177,7 +179,7 @@ class MockRobot(Node):
         self.yaw = math.atan2(dy, dx)
         self.x += move * dx / dist
         self.y += move * dy / dist
-        self.battery = max(0.0, self.battery - DRAIN_PER_M * move)
+        self.battery = max(0.0, self.battery - self.drain_per_m * move)
 
     def fail(self, reason):
         self.mode, self.error, self.goal = ERROR, reason, None
@@ -247,21 +249,29 @@ def main():
     ap.add_argument("--prefix", default="robot", help="names are <prefix>_1, <prefix>_2, ...")
     ap.add_argument("--speed", type=float, default=0.8, help="m/s")
     ap.add_argument("--spacing", type=float, default=2.0, help="m between docks on the x axis")
+    ap.add_argument("--origin-x", type=float, default=0.0, help="x of the first dock")
     ap.add_argument("--fault-rate", type=float, default=0.0, help="random faults per robot per minute")
     ap.add_argument("--drop-seconds", type=float, default=10.0, help="silence length for drop_comms")
     ap.add_argument("--roam-rate", type=float, default=0.0,
                     help="random Wi-Fi roaming gaps per robot per minute")
     ap.add_argument("--roam-max", type=float, default=4.0, help="longest roaming gap in seconds (min 0.5)")
+    ap.add_argument("--battery", type=float, default=None,
+                    help="start battery %% for every robot (default: random 60-100)")
+    ap.add_argument("--drain-per-m", type=float, default=DRAIN_PER_M, help="battery %% used per metre driven")
+    ap.add_argument("--charge-rate", type=float, default=CHARGE_RATE, help="battery %% gained per second on the dock")
     ap.add_argument("--seed", type=int, default=None)
     args, ros_args = ap.parse_known_args()
     random.seed(args.seed)
 
     rclpy.init(args=ros_args)
-    robots = [MockRobot(f"{args.prefix}_{i + 1}", x=i * args.spacing, y=0.0,
-                        speed=args.speed, battery=random.uniform(60.0, 100.0),
-                        fault_rate=args.fault_rate, drop_seconds=args.drop_seconds,
-                        roam_rate=args.roam_rate, roam_max=args.roam_max)
-              for i in range(args.count)]
+    robots = []
+    for i in range(args.count):
+        battery = random.uniform(60.0, 100.0)  # drawn even when fixed, so --seed gives the same run
+        robots.append(MockRobot(f"{args.prefix}_{i + 1}", x=args.origin_x + i * args.spacing, y=0.0,
+                                speed=args.speed, battery=battery if args.battery is None else args.battery,
+                                fault_rate=args.fault_rate, drop_seconds=args.drop_seconds,
+                                roam_rate=args.roam_rate, roam_max=args.roam_max,
+                                drain_per_m=args.drain_per_m, charge_rate=args.charge_rate))
     executor = MultiThreadedExecutor()
     for r in robots:
         executor.add_node(r)

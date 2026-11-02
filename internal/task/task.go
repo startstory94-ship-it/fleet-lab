@@ -67,6 +67,7 @@ type Task struct {
 	restoring    bool      // loaded after a restart, robot has not confirmed the leg
 	restoreUntil time.Time // grace end; zero until the first MQTT connection
 	probed       bool      // restored leg was re-sent once to ask the robot
+	handBack     bool      // battery critical: robot cancelled, requeue once it stopped
 }
 
 func (t *Task) active() bool { return t.State == Assigned || t.State == Running }
@@ -74,7 +75,7 @@ func (t *Task) active() bool { return t.State == Assigned || t.State == Running 
 // Command is published to fleet/<robot>/cmd.
 type Command struct {
 	CmdID     string  `json:"cmd_id"`
-	Type      string  `json:"type"` // goto, cancel
+	Type      string  `json:"type"` // goto, cancel, dock
 	X         float64 `json:"x"`
 	Y         float64 `json:"y"`
 	Yaw       float64 `json:"yaw"`
@@ -88,12 +89,15 @@ type Ack struct {
 	Message string `json:"message"`
 }
 
-// Event reports a task state change.
+// Event reports a task state change or a battery policy step.
 type Event struct {
-	Time   time.Time
-	Task   string
-	Robot  string
-	Kind   string // assigned, running, leg_done, done, requeued, failed, cancelled
+	Type  string // task, battery
+	Time  time.Time
+	Task  string
+	Robot string
+	// task: assigned, running, leg_done, done, requeued, failed, cancelled
+	// battery: low, dock_sent, docking, charged, dock_failed
+	Kind   string
 	From   string // task state before
 	To     string // task state after
 	Detail string

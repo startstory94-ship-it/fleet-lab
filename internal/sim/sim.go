@@ -2,6 +2,10 @@
 // commands from the task manager, drive in straight lines on a fake clock,
 // feed state into a real fleet.Registry and ack like the ROS adapter.
 //
+// Robots drain their battery per metre driven. A dock command sends a robot
+// back to where it was added; there it is CHARGING until 100 %, then IDLE,
+// like mock_fleet.py.
+//
 // No MQTT, no ROS. Commands and acks can be delayed with random jitter, so
 // they arrive late and out of order (a cancel can overtake its goto). A link
 // outage holds commands and acks until it ends, like a robot whose network
@@ -25,7 +29,7 @@ type Robot struct {
 	Name    string
 	X, Y    float64
 	Floor   int
-	Mode    string // IDLE, MOVING, ERROR
+	Mode    string // IDLE, MOVING, DOCKING, CHARGING, ERROR
 	Error   string
 	Battery float64
 	Goal    string // cmd_id of the goto being driven, "" when none
@@ -33,8 +37,12 @@ type Robot struct {
 	Started []string
 	// IdleCancels counts cancels that found nothing to cancel.
 	IdleCancels int
+	// Charges counts arrivals at the dock.
+	Charges int
 
 	gx, gy   float64
+	dockX    float64
+	dockY    float64
 	silent   bool
 	inbox    []inCmd
 	outbox   []outAck
@@ -70,26 +78,45 @@ type Fleet struct {
 	dropAcks float64
 	dropped  int
 	onAck    func(robot string, a task.Ack)
+	drain    float64 // % per metre driven
+	charge   float64 // % per second on the dock
 }
 
 // New creates an empty fleet. Robots move at speed m/s.
 func New(reg *fleet.Registry, now func() time.Time, speed float64, seed uint64) *Fleet {
 	return &Fleet{reg: reg, now: now, speed: speed, robots: make(map[string]*Robot),
-		rng: rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)), onAck: func(string, task.Ack) {}}
+		rng: rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)), onAck: func(string, task.Ack) {},
+		charge: 1}
 }
 
 // OnAck sets where acks go (task.Manager.HandleAck).
 func (f *Fleet) OnAck(h func(robot string, a task.Ack)) { f.onAck = h }
 
-// Add places an IDLE robot on floor 1. Its first report is a pose only, as
-// when an adapter starts: the server sees the robot before its state.
+// Add places an IDLE robot on floor 1, at its dock, with 90 % battery. Its
+// first report is a pose only, as when an adapter starts: the server sees the
+// robot before its state.
 func (f *Fleet) Add(name string, x, y float64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.robots[name] = &Robot{Name: name, X: x, Y: y, Floor: 1, Mode: "IDLE", Battery: 90,
-		book: make(map[string]*task.Ack)}
+		dockX: x, dockY: y, book: make(map[string]*task.Ack)}
 	f.names = append(f.names, name)
 	sort.Strings(f.names)
+}
+
+// SetBatteryModel sets the drain in % per metre driven (default 0) and the
+// charge rate in % per second on the dock (default 1).
+func (f *Fleet) SetBatteryModel(drainPerM, chargeRate float64) {
+	f.mu.Lock()
+	f.drain, f.charge = drainPerM, chargeRate
+	f.mu.Unlock()
+}
+
+// SetBattery sets one robot's battery level in %.
+func (f *Fleet) SetBattery(name string, pct float64) {
+	f.mu.Lock()
+	f.robots[name].Battery = pct
+	f.mu.Unlock()
 }
 
 // SetDelay makes every command and ack take delay plus a random part of
@@ -119,7 +146,10 @@ func (f *Fleet) Dropped() int {
 func (f *Fleet) Fault(name, reason string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	r := f.robots[name]
+	f.fault(f.robots[name], reason)
+}
+
+func (f *Fleet) fault(r *Robot, reason string) {
 	if r.Goal != "" {
 		f.finish(r, "failed", "robot in ERROR: "+reason)
 	}
@@ -263,14 +293,27 @@ func (f *Fleet) handle(r *Robot, c task.Command, now time.Time) {
 		r.Goal, r.gx, r.gy, r.Mode = c.CmdID, c.X, c.Y, "MOVING"
 		r.Started = append(r.Started, c.CmdID)
 	case "cancel":
-		if r.Goal == "" {
+		if r.Goal == "" && r.Mode != "DOCKING" {
 			r.IdleCancels++
 			f.ack(r, c.CmdID, "failed", "nothing to cancel")
 			return
 		}
-		f.finish(r, "cancelled", "stopped before the goal")
+		if r.Goal != "" {
+			f.finish(r, "cancelled", "stopped before the goal")
+		}
 		r.Mode = "IDLE"
 		f.ack(r, c.CmdID, "accepted", "")
+	case "dock":
+		// The adapter ends a tracked goto as cancelled once the dock is accepted.
+		if r.Mode == "ERROR" {
+			f.ack(r, c.CmdID, "failed", "in ERROR ("+r.Error+")")
+			return
+		}
+		if r.Goal != "" {
+			f.finish(r, "cancelled", "dock requested by "+c.CmdID)
+		}
+		r.Mode = "DOCKING"
+		f.ack(r, c.CmdID, "accepted", "docking")
 	case "reset_error":
 		if r.Mode != "ERROR" {
 			f.ack(r, c.CmdID, "failed", "not in ERROR")
@@ -284,19 +327,43 @@ func (f *Fleet) handle(r *Robot, c task.Command, now time.Time) {
 }
 
 func (f *Fleet) drive(r *Robot, dt float64, now time.Time) {
-	if r.Goal == "" || r.Mode == "ERROR" {
+	switch {
+	case r.Mode == "CHARGING":
+		r.Battery = min(100, r.Battery+f.charge*dt)
+		if r.Battery >= 100 {
+			r.Mode = "IDLE"
+		}
+	case r.Mode == "DOCKING":
+		if f.move(r, r.dockX, r.dockY, dt) {
+			r.Mode = "CHARGING"
+			r.Charges++
+		}
+	case r.Goal != "" && r.Mode != "ERROR":
+		if f.move(r, r.gx, r.gy, dt) {
+			r.Mode = "IDLE"
+			f.finish(r, "done", "")
+		}
+	default:
 		return
 	}
-	dx, dy := r.gx-r.X, r.gy-r.Y
+	if r.Battery <= 0 && (r.Mode == "MOVING" || r.Mode == "DOCKING") {
+		f.fault(r, "battery_empty")
+	}
+}
+
+// move drives r toward (x, y) for dt seconds and reports arrival.
+func (f *Fleet) move(r *Robot, x, y, dt float64) bool {
+	dx, dy := x-r.X, y-r.Y
 	dist := math.Hypot(dx, dy)
-	step := f.speed * dt
-	if dist <= step {
-		r.X, r.Y, r.Mode = r.gx, r.gy, "IDLE"
-		f.finish(r, "done", "")
-		return
+	step := min(dist, f.speed*dt)
+	r.Battery = max(0, r.Battery-f.drain*step)
+	if dist <= f.speed*dt {
+		r.X, r.Y = x, y
+		return true
 	}
 	r.X += step * dx / dist
 	r.Y += step * dy / dist
+	return false
 }
 
 // finish ends the current goto with a final ack.
@@ -321,5 +388,5 @@ func (f *Fleet) report(r *Robot) {
 	}
 	r.stateSeq++
 	f.reg.ApplyState(r.Name, fleet.StateMsg{Boot: "sim", Seq: r.stateSeq, Host: "sim",
-		Mode: r.Mode, Battery: r.Battery, TaskID: r.Goal, Error: r.Error})
+		Mode: r.Mode, Battery: &r.Battery, TaskID: r.Goal, Error: r.Error})
 }
