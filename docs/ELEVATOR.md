@@ -135,7 +135,8 @@ fleetd 구독: `elevator/+/state`, `elevator/+/zone`, `elevator/+/trip`, `fleet/
 - 끊긴 동안 생긴 이벤트는 쌓아 두었다가 와이파이가 돌아오면 보낸다(순서 상관없음).
 - 서버는 seq 순서로 기록한다: 다음 번호면 바로, 빈 번호가 있으면 최대 1초(`EventReorder`) 기다린 뒤 건너뛰고 기록(로그 경고). 중복·옛 번호는 버린다.
   기록은 `type: "elevator"`, `kind: "robot_event"`, `detail: "#17 exited at 09:00:31.600 (robot clock), floor 3, trip E1-k3x9ab-1"`.
-- 이벤트 이름(6b가 보낼 것): `ride_accepted`, `ride_cancelled`, `boarding`(선택), `boarded`, `exit_failed`, `exited`, `rescued`(사람이 꺼냄). 서버는 이름을 해석하지 않고 기록만 한다.
+- 이벤트 이름(6b가 보낼 것): `ride_accepted`, `ride_cancelled`, `boarding`(선택), `boarded`, `board_failed`, `exit_failed`, `exited`, `rescued`(사람이 꺼냄).
+  (6b 어댑터: `ride_accepted`·`ride_cancelled`·`boarding`은 와이파이가 있을 때 바로, 나머지는 쌓았다가. `rescued`는 사람이 꺼냈을 때.) 서버는 이름을 해석하지 않고 기록만 한다.
   (판단은 `zone`과 `cmd_ack`로 한다. 이벤트는 차 안에서 일어난 일의 기록이다.)
 
 ### 3.6 엘리베이터 명령 (`elevator/<id>/cmd`)
@@ -226,13 +227,15 @@ fleetd 구독: `elevator/+/state`, `elevator/+/zone`, `elevator/+/trip`, `fleet/
 - `n`은 운행 안에서 1씩 는다. **로봇은 자기 이름의 `turn`에만 움직인다.**
 - 서버는 답이 올 때까지 5초마다 **같은 `n`으로** 다시 보낸다(turn이나 답이 유실돼도 이어지게).
 - 이미 답한 `n`이 다시 오면 다시 움직이지 말고 **같은 결과를 다시 보낸다.**
-- 움직이는 중에 같은 `n`이 다시 오면 무시한다.
+- 움직이는 중(문 구역 안)에는 **어떤 turn에도 답하지 않는다**: 같은 `n`은 물론, 늦게 온 옛 `n`도 무시한다(옛 `n`의 답을 다시 보내면 엘리베이터가 그 로봇을 문 구역 수에서 빼 버린다).
+  움직임이 끝나면 옛 `n`에는 다시 같은 답을 보낸다.
 - 새 `n`인데 그 일을 이미 했으면(탔는데 `board`, 내렸는데 `exit`: 앞 답이 유실·지연돼 서버가 재시도한 경우) 움직이지 말고 `clear`로 답한다.
 - 자기 `ride.trip`이 아닌 운행의 turn, `done`을 보낸 뒤의 turn은 무시한다.
 - `exit` turn의 `lobby`가 그 층에서 나와 설 곳이다(넘겨져서 계획과 다른 층에서 내릴 때도).
 - **차 안에서 exit turn이 안 오면 기다린다.** 스스로 내리지 않는다. 서버가 다시 보내거나(5초마다), 재시도·넘김을 정한다.
 - `action: "board"`: 아래 4장의 탑승 순서. `"exit"`: 하차 순서. `floor`는 지금 문이 열린 층이다.
 - `exit`의 `floor`가 `ride.exit_floor`와 달라도(다음 층으로 넘겨진 경우) 내린다.
+- 아직 로비에 있는데(탑승 전) `exit` turn이 오면 움직이지 않고 `failed`(`reason: "not in the car"`)로 답한다.
 
 ### 3.10 문 구역 결과 (`elevator/<id>/zone`)
 
@@ -329,8 +332,27 @@ RIDING  turn(exit, 나, floor F) ─▶ zone{exit, enter} → 문 구역 → tur
 - 쌓아 둔 이벤트는 seq를 붙인 채 그대로 보낸다(서버가 순서를 맞춘다).
 
 mock 엘리베이터(6b)가 할 일: 3.6·3.7. 층 이동(`floor_s`), 문 열기·닫기(`door_s`), `hold_s` 만료, 같은 `cmd_id` 무시, 1초마다 상태,
-`zone`을 구독해 `door_zone`을 세기(`enter` +1, 같은 로봇의 `clear`/`failed` -1, turn과 상관없이) — 0이 아니면 문을 닫지 않는다.
+`zone`을 구독해 `door_zone`을 세기(`enter` +1, 같은 로봇의 `clear`/`failed` -1, turn과 상관없이. 단 같은 운행에서 그 로봇의 마지막 `enter`보다 작은 `n`의 답은 빼지 않는다) — 0이 아니면 문을 닫지 않고,
+서 있는 차의 문이 닫혀 있거나 닫히는 중이면 다시 열며, 0이 아니면 출발하지 않는다.
 `hold`는 열린 문만 유지하고, 닫힌 문은 같은 층 `goto`로만 다시 연다. 실패 주입: 응답 없음, 문 막힘.
+
+6b 구현(`cmd/mockelevator`, `adapter/fleet_logic.py`의 `RobotRide`)에서 정한 것 — 규약에는 영향 없음:
+- mock 엘리베이터는 fleetd와 같은 `-elevators` 파일을 읽는다(`-floor-s`, `-door-s`로 덮어쓰기). 문 막힘은 `door_zone`에 1을 더한다(문이 닫히지 않고 지휘자는 turn을 주지 않음).
+  실패는 `-unresponsive <id>`, `-door-blocked <id>` 또는 실행 중 `mockelevator/<id>/fault`에 `{"unresponsive":bool,"door_blocked":bool}`.
+- 어댑터의 끊김은 탑승 turn에서 `BOARDING` 상태(+`silence_s`)를 보낸 직후 시작해, 하차 `clear` 1초 뒤 끝난다. 그동안 그 로봇의 `fleet/*`는 아무것도 보내지 않고 받은 명령은 버린다
+  (실제로 닿지 않으므로). 와이파이가 돌아오면 `pose`(새 층) → `state`(`IDLE`, `silence_s` 0) → 쌓인 이벤트(seq 순) → `cmd_ack done`(+`floor`) 순서로 보낸다.
+  `pose`를 먼저 보내는 것은 지휘자가 "와이파이로 ONLINE"을 볼 때 옛 층을 쓰지 않게 하기 위해서다.
+- 탑승 실패(`zone{board, failed}`)면 로봇은 로비에 있으므로 끊김을 곧바로 끝내고 `WAITING_ELEVATOR`(그 ride `cmd_id`)를 다시 보고한다. 서버의 `cancel`로 끝난다.
+- **움직임 시간 제한:** 어댑터는 `elevator_move`를 보낸 뒤 `turn_timeout_s` + 30초(`--move-timeout-extra`) 안에 로봇이 그 움직임을 끝냈다고 알리지 않으면 `failed`(`robot did not finish the move`)로 답한다
+  (움직임 명령 유실, 로봇 프로그램 재시작). 탑승이면 끊김을 끝내고 `WAITING_ELEVATOR`를 보고한다. 단 로봇이 그 움직임을 아직 `running`으로 알리면(느림, 문 구역에서 고장으로 멈춤) 계속 기다린다:
+  로봇이 문 구역에 있으므로 답하지 않는 것이 맞다(지휘자는 시간 초과로 재시도만 하고 아무도 움직이지 않는다).
+- mock 로봇이 움직이는 중 고장(ERROR)이 나면 그 자리(문 구역일 수 있음)에 멈추고 움직임은 `running`으로 남는다. `reset_error`(사람이 손봄)가 움직임 시작점으로 되돌린 뒤에야 `failed`를 알린다.
+- **운행이 로봇을 태운 채 끝나면**(차 안 `RIDING`인데 retained 운행이 비거나, 그 운행이 `done`/`aborted`가 되거나, 다른 운행으로 바뀌거나, 60초 동안 운행도 turn도 오지 않음):
+  어댑터는 끊김을 끝내고 `pose`(차의 층) → `state` → 쌓인 이벤트 + `exit_failed`("still in the car, needs a human") → `cmd_ack failed`(+`floor`)를 보낸다.
+  그 뒤 로봇이 차 밖으로 나올 때까지 `state`는 `mode: "ERROR"`, `error: "in elevator E1 without a ride: needs a human"`(배정되지 않게). 로봇이 차 밖이라고 알리면(`in_car: false`) `rescued` 이벤트와 평소 상태.
+  어댑터가 다시 시작해서 차 안 로봇을 모를 때도 로봇이 `in_car: true`면 같은 ERROR로 보고한다.
+- 운행 중에 사람이 로봇을 꺼내면(움직임 없이 `in_car: false`) `rescued` 이벤트를 쌓고 하차처럼 와이파이 복귀 → `done`(+그 층). 지휘자는 와이파이로 ONLINE이 된 것을 보고 밖으로 확인한다.
+- 로봇은 어댑터가 보내는 `elevator_move`(board/floor/exit)로 움직인다(mock_robots/README.md). 차 안 위치는 로비에서 +x 쪽: 문 +1.0 m, 칸 0 +1.8 m, 칸마다 +0.8 m(대시보드도 같은 값으로 그린다).
 
 ## 6. 실패 처리
 
@@ -352,7 +374,8 @@ mock 엘리베이터(6b)가 할 일: 3.6·3.7. 층 이동(`floor_s`), 문 열기
 | 와이파이가 훨씬 늦게(나온 뒤) | OFFLINE | 내린 것은 확인됐으므로 평소 규칙: 시도 1번, 다른 로봇에게(지켜보기). 돌아온 로봇은 아무것도 안 함 |
 | 와이파이가 안 돌아옴(안에 갇힘 의심) | 로봇 레지스트리의 `elevator_overdue` + 운행 임대 만료 | `overdue`("lease expired") 경보. 로봇이 안에 있는 동안 작업은 그 로봇에(두 로봇이 같은 작업을 하지 않게) |
 | 임대(lease) 만료 | 예상 + 60초 | 탑승 전이면 중단(안전). 탄 뒤면 `overdue` 경보와 함께 밖으로 확인되지 않은 로봇마다 `stuck` 처리(작업은 다른 로봇에게, 한 번만). 엘리베이터는 **그 로봇들이 확인되거나 운영자가 놓을 때까지** 예약된 채로 |
-| 운영자 강제 반환 | `POST /elevators/{id}/release` | `release` 명령, 운행 끝(`released`, "by operator"), retained 운행 지움. 탑승 전 로봇은 `cancel` 후 다시 대기, 밖으로 확인되지 않은 로봇의 작업은 시도 없이 대기열로 + 지켜보기(`cancel`). 사람이 차 안 로봇을 처리한 뒤 쓴다 |
+| 운영자 강제 반환 | `POST /elevators/{id}/release` | `release` 명령, 운행 끝(`released`, "by operator"), retained 운행 지움. 탑승 전 로봇은 `cancel` 후 다시 대기, 밖으로 확인되지 않은 로봇의 작업은 시도 없이 대기열로 + 지켜보기(`cancel`). 차 안에 남은 로봇의 어댑터는 운행이 끝난 것을 보고 끊김을 끝내며 ride는 `failed`, 로봇은 꺼낼 때까지 ERROR("needs a human")로 보고한다(5장) |
+| 갇힌 로봇 꺼내기(운영자 절차) | 대시보드 경보 "갇힘"/"막힘", 로봇 IN_ELEVATOR→STALE | ① 대시보드에서 차·층·칸 확인 ② 사람이 로봇을 꺼내 그 층 로비에 둔다(mock: 로봇의 `rescue` 서비스, 와이파이가 돌아온 뒤면 `fleet/<robot>/cmd` `{"type":"rescue"}`) — 운행 중에 꺼내면 로봇이 `done`(+층)을 보내 운행이 스스로 끝난다 ③ 운행이 아직 묶여 있으면 "강제 반환"(`POST /elevators/{id}/release`) ④ 로봇이 ERROR로 남아 있으면 꺼낸 뒤 `rescued` 이벤트와 함께 대기로 돌아오는지 확인. 고장 난 로봇이면 `reset_error` |
 | 대기 로봇의 목적층이 지금 층 | 계획 때 | 타지 않고 그 구간을 그냥 `goto`로 끝낸다 |
 | 배터리 위험(10% 미만) | 배터리 정책 | 로비에서 대기 중이거나 `planned` 단계(아직 아무도 안 움직임)면 작업을 돌려주고(시도 안 씀) 도크로. **탑승이 시작되면 돌려받지 않는다**: 내린 뒤 지점으로 가는 `goto`에서 평소처럼 돌려준다. 타고 있는 로봇에게 `dock`을 보내지 않는다 |
 | 사용자 취소 | API | 대기 중·탑승 전이면 빠지고 `cancel`. 문을 지나기 시작했거나 안에 있으면 운행은 그 로봇을 계획대로 내려 준다(작업만 CANCELLED) |

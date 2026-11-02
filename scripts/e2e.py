@@ -1,8 +1,12 @@
 """End-to-end scenarios: fleetd + ROS 2 mock robots + adapter + Mosquitto.
 
 Starts everything, runs each scenario against the real processes, prints
-PASS/FAIL per step and exits non-zero on any failure. Takes under two
-minutes.
+PASS/FAIL per step and exits non-zero on any failure. Takes about four
+minutes (the elevator rides of stage 6 take most of it).
+
+The mock elevator (cmd/mockelevator) runs from the start with the same
+-elevators file as fleetd. `--only elevator` runs just the connection step and
+the elevator scenarios (for working on them).
 
 Needs: Mosquitto on 127.0.0.1:1883, Go on PATH, and a shell where ROS 2 is
 set up (pixi shell + local_setup.bat). Use scripts\\e2e.bat on Windows.
@@ -24,6 +28,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from collections import defaultdict
 from datetime import datetime
 
 import paho.mqtt.client as mqtt
@@ -109,14 +114,28 @@ def start(cmd, log):
                             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
 
 
+# The elevator of the e2e run: fleetd and the mock elevator read the same file.
+# One car, floors 1-8, lobby (10, 0) on every floor, 1 s per floor, 1 s doors.
+# A short turn timeout (8 s) keeps the slow-door scenario short.
+ELEVATORS = {"elevators": [{"id": "E1", "capacity": 3, "floors": [1, 2, 3, 4, 5, 6, 7, 8],
+                            "lobby": {"x": 10, "y": 0}, "floor_s": 1, "door_s": 1}],
+             "timing": {"turn_timeout_s": 8, "turn_estimate_s": 8}}
+
+
 def main():
+    only = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else ""
     tmp = tempfile.mkdtemp(prefix="fleet-e2e-")
-    exe = os.path.join(tmp, "fleetd.exe" if os.name == "nt" else "fleetd")
+    ext = ".exe" if os.name == "nt" else ""
+    exe, car_exe = os.path.join(tmp, "fleetd" + ext), os.path.join(tmp, "mockelevator" + ext)
     subprocess.run(["go", "build", "-o", exe, "./cmd/fleetd"], cwd=ROOT, check=True)
-    logs = {n: open(os.path.join(tmp, n + ".log"), "w") for n in ("fleetd", "robots", "adapter")}
+    subprocess.run(["go", "build", "-o", car_exe, "./cmd/mockelevator"], cwd=ROOT, check=True)
+    lifts = os.path.join(tmp, "elevators.json")
+    with open(lifts, "w") as f:
+        json.dump(ELEVATORS, f)
+    logs = {n: open(os.path.join(tmp, n + ".log"), "w") for n in ("fleetd", "robots", "adapter", "elevator")}
     print(f"logs: {tmp}")
 
-    fleetd_cmd = [exe, "-http", API.removeprefix("http://"), "-db", os.path.join(tmp, "f.db")]
+    fleetd_cmd = [exe, "-http", API.removeprefix("http://"), "-db", os.path.join(tmp, "f.db"), "-elevators", lifts]
 
     def restart_fleetd():
         """Hard-kill fleetd and start it again on the same database."""
@@ -129,16 +148,21 @@ def main():
         """Start another mock robot process; the running adapter bridges it."""
         logs[name] = open(os.path.join(tmp, name + ".log"), "w")
         procs[name] = start([sys.executable, "-u", "mock_robots/mock_fleet.py"] + args, logs[name])
+        return procs[name]
 
+    clear_retained()
     procs = {
+        "elevator": start([car_exe, "-elevators", lifts], logs["elevator"]),
         "fleetd": start(fleetd_cmd, logs["fleetd"]),
         "robots": start([sys.executable, "-u", "mock_robots/mock_fleet.py", "--count", "3", "--seed", "1",
                          "--drop-seconds", str(DROP_SECONDS)], logs["robots"]),
-        "adapter": start([sys.executable, "-u", "adapter/fleet_adapter.py", "--host-id", "e2e"], logs["adapter"]),
+        # tx_1 (elevator scenario) loses its first elevator turn.
+        "adapter": start([sys.executable, "-u", "adapter/fleet_adapter.py", "--host-id", "e2e",
+                          "--ignore-turns", "tx_1:1"], logs["adapter"]),
     }
     m = Mqtt()
     try:
-        run(m, procs, restart_fleetd, start_mock)
+        run(m, procs, restart_fleetd, start_mock, only)
     finally:
         for p in procs.values():
             if p.poll() is None:
@@ -151,13 +175,16 @@ def main():
     sys.exit(1 if failed else 0)
 
 
-def run(m, procs, restart_fleetd, start_mock):
+def run(m, procs, restart_fleetd, start_mock, only=""):
     names = ["robot_1", "robot_2", "robot_3"]
 
     # 1. connection
     ok = wait_for(lambda: all((robot(n) or {}).get("conn") == "ONLINE" for n in names), 30)
     step("3 robots visible and ONLINE", bool(ok))
     if not ok:
+        return
+    if only == "elevator":
+        elevator_steps(m, start_mock)
         return
 
     # 2. goto: accepted -> done, robot ends at the goal, task_id shown while moving
@@ -245,7 +272,10 @@ def run(m, procs, restart_fleetd, start_mock):
     # 12. dashboard and live frames
     live_steps()
 
-    # 13. adapter crash -> LWT -> all OFFLINE. kill() is a hard kill (no clean
+    # 13. elevator rides (stage 6): mixed destinations, then an exit failure
+    elevator_steps(m, start_mock)
+
+    # 14. adapter crash -> LWT -> all OFFLINE. kill() is a hard kill (no clean
     # "offline" message), so only the broker's LWT can report it.
     procs["adapter"].kill()
     step("adapter crash takes all robots OFFLINE",
@@ -529,6 +559,405 @@ def live_scenario(ws, everyone):
         post_json(f"/tasks/{tid}/cancel", {})
     except Exception:
         pass  # already finished
+
+
+# ------------------------------------------------------------------ elevator (stage 6)
+
+LINK_BACK_S = 1.0  # adapter: Wi-Fi comes back this long after the exit clear
+
+
+class LiftWatch:
+    """Records, with arrival times, everything on the elevator channel of E1
+    and the robots' fleet topics: car states (door_zone), turns and zone
+    answers, and what each robot publishes while it should have no Wi-Fi."""
+
+    def __init__(self, car="E1"):
+        self.lock = threading.Lock()
+        self.states, self.zones, self.turns, self.fleet = [], [], [], []
+        self.c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"e2e-lift-{uuid.uuid4().hex[:6]}")
+        self.c.on_message = self.on_message
+        self.c.connect("127.0.0.1", 1883)
+        for t in (f"elevator/{car}/state", f"elevator/{car}/zone", f"elevator/{car}/turn",
+                  "fleet/+/state", "fleet/+/pose", "fleet/+/event", "fleet/+/cmd_ack"):
+            self.c.subscribe(t, qos=1)
+        self.c.loop_start()
+
+    def on_message(self, client, userdata, msg):
+        now = time.monotonic()
+        try:
+            body = json.loads(msg.payload)
+        except ValueError:
+            return
+        parts = msg.topic.split("/")
+        with self.lock:
+            if parts[0] == "elevator":
+                {"state": self.states, "zone": self.zones, "turn": self.turns}[parts[2]].append((now, body))
+            elif parts[1] != "adapter":
+                self.fleet.append((now, parts[1], parts[2], body))
+
+    def close(self):
+        self.c.loop_stop()
+        self.c.disconnect()
+
+    def snapshot(self, robots=None, since=0.0):
+        """States after since; zones, turns and fleet messages of robots after since."""
+        with self.lock:
+            keep = lambda r: robots is None or r in robots  # noqa: E731
+            return ([(t, s) for t, s in self.states if t >= since],
+                    [(t, z) for t, z in self.zones if t >= since and keep(z.get("robot"))],
+                    [(t, x) for t, x in self.turns if t >= since and keep(x.get("robot"))],
+                    [(t, r, k, b) for t, r, k, b in self.fleet if t >= since and keep(r)])
+
+
+def zone_counts(zones):
+    """Most robots in the door zone at once, counted from the robots' own
+    enter/clear/failed messages (independent of the car's door_zone). An
+    answer only ends the robot's newest enter (like the mock car)."""
+    inside, most = {}, 0
+    for _, z in zones:
+        if z["event"] == "enter":
+            inside[z["robot"]] = max(inside.get(z["robot"], 0), z["n"])
+        elif z["n"] >= inside.get(z["robot"], 1 << 30):
+            inside.pop(z["robot"])
+        most = max(most, len(inside))
+    return most
+
+
+def answers(zones):
+    """The first answer (clear/failed) for each turn (trip, n), in arrival
+    order; repeats of an answer are left out."""
+    seen, out = set(), []
+    for t, z in zones:
+        k = (z["trip"], z["n"])
+        if z["event"] != "enter" and k not in seen:
+            seen.add(k)
+            out.append((t, z))
+    return out
+
+
+def enters_once(zones):
+    """(trip, n, robot) entered more than once. Must be empty."""
+    c = defaultdict(int)
+    for _, z in zones:
+        if z["event"] == "enter":
+            c[(z["trip"], z["n"], z["robot"])] += 1
+    return {k: v for k, v in c.items() if v != 1}
+
+
+def door_rule_breaks(states, zones):
+    """Against the car's own states: every enter must follow a car state with
+    the door open at that floor, door_zone 0 and not moving, received after
+    the previous turn's answer; no state may show the car moving with
+    something in the door zone."""
+    ans = sorted(t for t, _ in answers(zones))
+    bad = []
+    for te, z in zones:
+        if z["event"] != "enter":
+            continue
+        prev = max([t for t in ans if t < te] or [te - 30])
+        # ±0.25 s: the car's state and the robot's messages come from different
+        # clients; the watcher can read them in either order when the
+        # conductor answers within a few milliseconds.
+        if not any(prev - 0.25 < ts < te + 0.25 and s.get("door") == "open" and s.get("door_zone") == 0 and not s.get("moving")
+                   and s.get("floor") == z["floor"] for ts, s in states):
+            near = [(round(ts - te, 2), s.get("floor"), s.get("door"), s.get("door_zone"), s.get("moving"))
+                    for ts, s in states if te - 4 < ts < te + 0.5]
+            bad.append(("enter without an empty open door", z["robot"], z["n"], round(prev - te, 2), near[-6:]))
+    bad += [("moving with door_zone", s.get("floor"), s.get("door_zone")) for _, s in states
+            if s.get("moving") and s.get("door_zone", 0) > 0]
+    return bad
+
+
+def blackout_leaks(zones, fleet, robot):
+    """Fleet messages the robot sent while it had no Wi-Fi: after its boarding
+    enter (+0.3 s for messages on their way) until LINK_BACK_S after its exit
+    clear (−0.1 s), and the gap from that clear to its first fleet message."""
+    enter = [t for t, z in zones if z["robot"] == robot and z["action"] == "board" and z["event"] == "enter"]
+    out = [t for t, z in zones if z["robot"] == robot and z["action"] == "exit" and z["event"] == "clear"]
+    if not enter or not out:
+        return None, None
+    lo, hi = enter[0] + 0.3, out[0] + LINK_BACK_S - 0.1
+    leaks = [(k, b.get("mode", b.get("event", b.get("status", "")))) for t, r, k, b in fleet if r == robot and lo < t < hi]
+    after = [t for t, r, k, b in fleet if r == robot and t > out[0]]
+    return leaks, (min(after) - out[0]) if after else None
+
+
+def lift_events(tail, robots, kinds_wanted):
+    return [e for e in list(tail.events) if e["type"] == "elevator" and kind(e) in kinds_wanted
+            and (e.get("robot") in robots or any(r in e.get("detail", "") for r in robots))]
+
+
+def planned_boarding(e):
+    """['lift_2', 'lift_3', 'lift_1'] and '[3 5 7]' from a trip_planned detail."""
+    m = re.search(r"board ([\w,]+); stops (\[[\d ]*\])", e.get("detail", ""))
+    return (m.group(1).split(","), m.group(2)) if m else ([], "")
+
+
+def trip_id(e):
+    m = re.search(r"(E1-[\w-]+?): ", e.get("detail", ""))
+    return m.group(1) if m else None
+
+
+def wait_robots(names, floor, timeout):
+    def ready():
+        rs = [robot(n) or {} for n in names]
+        return all(r.get("conn") == "ONLINE" and r.get("mode") == "IDLE" and r.get("has_pose") and r.get("floor") == floor
+                   for r in rs)
+    return wait_for(ready, timeout)
+
+
+def retire(proc, names, label):
+    """Robots idle on upper floors would be the nearest to the next tasks
+    (assignment adds 1000 m per floor): take them away."""
+    if proc is None:
+        return
+    proc.kill()
+    gone = wait_for(lambda: all((robot(n) or {}).get("conn") != "ONLINE" for n in names), 10)
+    step(f"{label} robots taken away (not ONLINE)", bool(gone))
+
+
+def common_checks(label, states, zones, fleet, robots):
+    """door_zone, door rules, one enter per turn, Wi-Fi blackout."""
+    zmax = max([s.get("door_zone", 0) for _, s in states] or [99])
+    ones = sum(1 for _, s in states if s.get("door_zone") == 1)
+    step(f"{label}: door_zone never above 1 (car states and robots' own enter/answer)",
+         zmax <= 1 and ones > 0 and zone_counts(zones) == 1, (zmax, ones, zone_counts(zones)))
+    breaks, twice = door_rule_breaks(states, zones), enters_once(zones)
+    step(f"{label}: every enter after an open, empty, standing car; never moving with door_zone > 0; one enter per turn",
+         not breaks and not twice and any(z["event"] == "enter" for _, z in zones), (breaks[:5], twice))
+    gaps = {r: blackout_leaks(zones, fleet, r) for r in robots}
+    step(f"{label}: no fleet/* message from a robot in the car, first one >= 0.9 s after its exit clear",
+         all(lk == [] and gap is not None and gap >= LINK_BACK_S - 0.1 for lk, gap in gaps.values()), gaps)
+
+
+def elevator_steps(m, start_mock):
+    try:
+        ok = wait_for(lambda: http_json("/elevators")[0]["responding"], 10)
+    except Exception:
+        ok = False
+    step("mock elevator E1 heard by fleetd", bool(ok))
+    if not ok:
+        return
+    watch, tail = LiftWatch(), EventTail()
+    try:
+        retire(mixed_ride(m, start_mock, watch, tail), LIFT, "lift")
+        retire(exit_failure(m, start_mock, watch, tail), FX, "fx")
+        retire(lost_turn_slow_door(m, start_mock, watch, tail), TX, "tx")
+        stuck_release_rescue(m, start_mock, watch, tail)
+    finally:
+        tail.close()
+        watch.close()
+
+
+LIFT = ["lift_1", "lift_2", "lift_3"]
+FX = ["fx_1", "fx_2"]
+TX = ["tx_1", "tx_2"]
+
+
+def mixed_ride(m, start_mock, watch, tail):
+    """lift_1..3 on floor 1 get tasks to floors 3, 7 and 5 at the same time.
+    They start 3-4.2 m from the lobby, so they arrive within 1 s of each
+    other (the batch window is 3 s). Returns the mock process."""
+    lift = LIFT
+    proc = start_mock("lift", ["--count", "3", "--prefix", "lift", "--origin-x", "13", "--spacing", "0.6",
+                               "--speed", "1.5", "--battery", "100", "--floor", "1"])
+    ok = wait_robots(lift, 1, 20)
+    step("elevator: lift_1..3 ONLINE and IDLE on floor 1", bool(ok), [robot(n) for n in lift])
+    if not ok:
+        return proc
+    t0 = time.monotonic()
+    want = {3: (13.0, 3.0), 7: (13.6, 3.0), 5: (14.2, 3.0)}
+    ids = {f: post_json("/tasks", {"waypoints": [{"x": x, "y": y, "floor": f}]})["id"] for f, (x, y) in want.items()}
+    done = wait_for(lambda: all(task(i)["state"] == "DONE" for i in ids.values()), 150, interval=0.5)
+    time.sleep(1.5)  # let the tail and the watcher catch up
+    print(f"      (mixed ride: tasks done in {time.monotonic() - t0:.0f} s)", flush=True)
+    tasks = {f: task(i) or {} for f, i in ids.items()}
+    dest = {t.get("robot"): f for f, t in tasks.items()}
+    states, zones, turns, fleet = watch.snapshot(lift, t0)
+
+    planned = lift_events(tail, lift, {"trip_planned"})
+    full = [e for e in planned if sorted(planned_boarding(e)[0]) == lift]
+    order, stops = planned_boarding(full[0]) if full else ([], "")
+    trip = trip_id(full[0]) if full else None
+    step("one trip carried all three: boarding 7,5,3, stops [3 5 7]",
+         len(full) == 1 and [dest.get(r) for r in order] == [7, 5, 3] and stops == "[3 5 7]",
+         [(e.get("detail"), dest) for e in planned])
+
+    ans = [z for _, z in answers(zones) if z["trip"] == trip]
+    boards = [z["robot"] for z in ans if z["action"] == "board" and z["event"] == "clear"]
+    exits = [(z["robot"], z["floor"]) for z in ans if z["action"] == "exit" and z["event"] == "clear"]
+    step("boarded one by one in order 7,5,3 (door-side robot last)", [dest.get(r) for r in boards] == [7, 5, 3], boards)
+    step("exited at 3, 5, 7 in that order, each at its own floor",
+         [f for _, f in exits] == [3, 5, 7] and all(dest.get(r) == f for r, f in exits), exits)
+    common_checks("mixed", states, zones, fleet, lift)
+
+    conn = defaultdict(list)
+    for e in list(tail.events):
+        if e["type"] == "conn" and e["robot"] in lift:
+            conn[e["robot"]].append(e["to"])
+    announced = {r: max([b.get("silence_s", 0) for _, rr, k, b in fleet if rr == r and k == "state"] or [0]) for r in lift}
+    step("each robot announced silence_s and was IN_ELEVATOR, never OFFLINE",
+         all("IN_ELEVATOR" in conn[r] and "OFFLINE" not in conn[r] and announced[r] > 0 for r in lift),
+         (dict(conn), announced))
+
+    evs = defaultdict(list)
+    for t, r, k, b in fleet:
+        if k == "event":
+            evs[r].append((t, b))
+    exit_t = {z["robot"]: t for t, z in answers(zones) if z["action"] == "exit" and z["event"] == "clear"}
+    names_ok = all([b["event"] for _, b in evs[r]] == ["ride_accepted", "boarding", "boarded", "exited"] for r in lift)
+    queued = all(t >= exit_t.get(r, 1e18) for r in lift for t, b in evs[r] if b["event"] in ("boarded", "exited"))
+    recorded = all(sum(1 for e in list(tail.events) if e["type"] == "elevator" and e.get("robot") == r
+                       and kind(e) == "robot_event") >= 4 for r in lift)
+    step("robot events (seq + robot time) queued in the car, sent after the exit, recorded by fleetd",
+         names_ok and queued and recorded, {r: [(b["seq"], b["event"]) for _, b in evs[r]] for r in lift})
+
+    acks = [(r, b.get("floor")) for t, r, k, b in fleet if k == "cmd_ack" and b["status"] == "done" and ".R" in b["cmd_id"]]
+    step("ride done acks carry the exit floor", sorted(acks) == sorted((r, f) for r, f in dest.items()), acks)
+
+    final = {f: (t.get("state"), t.get("robot"), (robot(t.get("robot")) or {}).get("floor"), t.get("dispatches"))
+             for f, t in tasks.items()}
+    step("3 ride tasks DONE, robots on floors 3, 5, 7, no reassignment",
+         bool(done) and all(s == "DONE" and fl == f and d == 1 for f, (s, _, fl, d) in final.items()), final)
+    lift_now = http_json("/elevators")[0]
+    released = [e for e in list(tail.events) if e["type"] == "elevator" and kind(e) == "released" and trip_id(e) == trip]
+    step("trip released and cleared", trip and lift_now.get("trip") is None and len(released) == 1,
+         (trip, lift_now.get("trip"), released))
+    return proc
+
+
+def exit_failure(m, start_mock, watch, tail):
+    """fx_1, fx_2 go to floors 4 and 6; every robot's first two exits at
+    floor 4 fail (blocked door zone). The robot for 4 is retried, carried to
+    6 and exits there first (door side); it comes back down on a new trip and
+    its task still ends DONE on floor 4."""
+    fx = FX
+    proc = start_mock("fx", ["--count", "2", "--prefix", "fx", "--origin-x", "30", "--speed", "2", "--battery", "100",
+                             "--floor", "1", "--exit-fail-floor", "4", "--exit-fail-count", "2"])
+    ok = wait_robots(fx, 1, 20)
+    step("exit failure: fx_1, fx_2 ONLINE on floor 1", bool(ok), [robot(n) for n in fx])
+    if not ok:
+        return proc
+    t0 = time.monotonic()
+    t4 = post_json("/tasks", {"waypoints": [{"x": 30.0, "y": 4.0, "floor": 4}]})["id"]
+    t6 = post_json("/tasks", {"waypoints": [{"x": 32.0, "y": 4.0, "floor": 6}]})["id"]
+    done = wait_for(lambda: task(t4)["state"] == "DONE" and task(t6)["state"] == "DONE", 180, interval=0.5)
+    time.sleep(1.5)
+    print(f"      (exit failure: tasks done in {time.monotonic() - t0:.0f} s)", flush=True)
+    a, b = (task(t4) or {}).get("robot"), (task(t6) or {}).get("robot")
+    states, zones, turns, fleet = watch.snapshot(fx, t0)
+    ex = [(z["robot"], z["floor"], z["event"]) for _, z in answers(zones) if z["action"] == "exit"]
+    step("exit at 4 failed, retried once, then carried: both exit at 6, the carried robot first",
+         ex[:4] == [(a, 4, "failed"), (a, 4, "failed"), (a, 6, "clear"), (b, 6, "clear")], ex)
+    re_ev = [e["detail"] for e in lift_events(tail, [a], {"replanned"})]
+    failed_ev = [e["detail"] for e in lift_events(tail, [a], {"exit_failed"})]
+    step("fleetd reported exit_failed (retry, gave up) and replanned the robot to floor 6",
+         len(failed_ev) >= 2 and any("exits at floor 6" in d for d in re_ev), (failed_ev, re_ev))
+    acks = [x.get("floor") for t, r, k, x in fleet if r == a and k == "cmd_ack" and x["status"] == "done" and ".R" in x["cmd_id"]]
+    step("carried robot acked done at floor 6, then rode back down and acked done at 4", acks == [6, 4], acks)
+    common_checks("exit failure", states, zones, fleet, fx)
+    fin = [(task(t) or {}) for t in (t4, t6)]
+    floors = [(robot(t.get("robot")) or {}).get("floor") for t in fin]
+    step("both tasks DONE on floors 4 and 6, no reassignment",
+         bool(done) and [t.get("state") for t in fin] == ["DONE", "DONE"] and floors == [4, 6]
+         and all(t.get("dispatches") == 1 for t in fin), [(t.get("state"), t.get("robot"), t.get("dispatches")) for t in fin] + floors)
+    return proc
+
+
+def lost_turn_slow_door(m, start_mock, watch, tail):
+    """tx_1, tx_2 on floor 2 go to floors 4 and 5. Every pass through the
+    door takes 10 s (--door-move-s), longer than the 8 s turn timeout of this
+    run, and the adapter loses tx_1's first turn (--ignore-turns tx_1:1).
+    The conductor must re-send the turn, never give the door to the other
+    robot while one is in the zone, and accept the late clears."""
+    tx = TX
+    proc = start_mock("tx", ["--count", "2", "--prefix", "tx", "--origin-x", "11", "--spacing", "0.5", "--speed", "2",
+                             "--battery", "100", "--floor", "2", "--door-move-s", "10"])
+    ok = wait_robots(tx, 2, 20)
+    step("lost turn + slow door: tx_1, tx_2 ONLINE on floor 2", bool(ok), [robot(n) for n in tx])
+    if not ok:
+        return proc
+    t0 = time.monotonic()
+    ids = [post_json("/tasks", {"waypoints": [{"x": 11.0, "y": 3.0, "floor": f}]})["id"] for f in (4, 5)]
+    done = wait_for(lambda: all(task(i)["state"] == "DONE" for i in ids), 200, interval=0.5)
+    time.sleep(1.5)
+    print(f"      (lost turn + slow door: tasks done in {time.monotonic() - t0:.0f} s)", flush=True)
+    states, zones, turns, fleet = watch.snapshot(tx, t0)
+    first = [(x["n"], x["action"]) for _, x in turns if x["robot"] == "tx_1"]
+    resent = len(first) >= 2 and first[0] == first[1]
+    entered_after_resend = [t for t, z in zones if z["robot"] == "tx_1" and z["event"] == "enter"]
+    step("the lost turn was re-sent with the same n and the robot moved on the re-send",
+         resent and bool(entered_after_resend) and entered_after_resend[0] > [t for t, x in turns if x["robot"] == "tx_1"][1] - 0.01,
+         first[:4])
+    od = [e["detail"] for e in list(tail.events) if e["type"] == "elevator" and kind(e) == "overdue" and t0 > 0
+          and any(r in e.get("detail", "") for r in tx)]
+    step("slow door: turns timed out (overdue) but nobody else moved", bool(od), od[:3])
+    common_checks("slow door", states, zones, fleet, tx)
+    fin = [(task(i) or {}) for i in ids]
+    step("both tasks DONE on floors 4 and 5",
+         bool(done) and [(robot(t.get("robot")) or {}).get("floor") for t in fin] == [4, 5],
+         [(t.get("state"), t.get("robot"), t.get("error")) for t in fin])
+    return proc
+
+
+def stuck_release_rescue(m, start_mock, watch, tail):
+    """sx_1 rides alone from floor 3 to 6, where every exit fails: it is
+    stuck at the last stop and the car stays blocked. Its task is cancelled
+    (another robot would take it), the operator releases the car, the adapter
+    ends the robot's blackout (ERROR: needs a human), a human takes it out
+    (the robot's rescue service, here through the fleet command "rescue") and
+    it is IDLE on floor 6 again."""
+    sx = "sx_1"
+    start_mock("sx", ["--count", "1", "--prefix", "sx", "--origin-x", "11", "--speed", "2", "--battery", "100",
+                      "--floor", "3", "--exit-fail-floor", "6", "--exit-fail-count", "-1"])
+    ok = wait_robots([sx], 3, 20)
+    step("stuck robot: sx_1 ONLINE on floor 3", bool(ok), robot(sx))
+    if not ok:
+        return
+    t0 = time.monotonic()
+    tid = post_json("/tasks", {"waypoints": [{"x": 11.0, "y": 3.0, "floor": 6}]})["id"]
+    blocked = wait_for(lambda: (http_json("/elevators")[0].get("trip") or {}).get("stage") == "blocked", 90, interval=0.5)
+    step("exit fails at the last stop: robot stuck, car blocked", bool(blocked),
+         (http_json("/elevators")[0].get("trip") or {}).get("riders"))
+    if not blocked:
+        return
+    try:
+        post_json(f"/tasks/{tid}/cancel", {})  # handed to another robot when sx_1 got stuck: stop it
+    except Exception:
+        pass
+    released = post_json("/elevators/E1/release", {})
+    back = wait_for(lambda: (robot(sx) or {}).get("conn") == "ONLINE" and robot(sx)["mode"] == "ERROR", 10)
+    r = robot(sx) or {}
+    step("after the operator release the robot is back ONLINE, ERROR 'needs a human', floor 6",
+         bool(back) and "needs a human" in r.get("error", "") and r.get("floor") == 6 and released.get("trip") is None,
+         (r.get("conn"), r.get("mode"), r.get("error"), r.get("floor")))
+    m.cmd(sx, {"cmd_id": f"rescue-{uuid.uuid4().hex[:6]}", "type": "rescue"})
+    idle = wait_for(lambda: robot(sx)["mode"] == "IDLE" and robot(sx)["error"] == "", 10)
+    time.sleep(1.0)
+    states, zones, turns, fleet = watch.snapshot([sx], t0)
+    evs = [b["event"] for t, r_, k, b in fleet if k == "event"]
+    acks = [(b["status"], b.get("floor")) for t, r_, k, b in fleet if k == "cmd_ack" and ".R" in b["cmd_id"]]
+    step("rescued: IDLE on floor 6, events exit_failed .. rescued, ride acked failed with floor 6",
+         bool(idle) and robot(sx)["floor"] == 6 and evs[-2:] == ["exit_failed", "rescued"] and acks[-1] == ("failed", 6),
+         (robot(sx), evs, acks))
+    zmax = max([s.get("door_zone", 0) for _, s in states] or [99])
+    step("car free again, door_zone never above 1",
+         http_json("/elevators")[0].get("trip") is None and zmax <= 1 and not door_rule_breaks(states, zones),
+         (zmax, door_rule_breaks(states, zones)[:3]))
+
+
+def clear_retained():
+    """An earlier run (killed, or ended with a blocked car) can leave a
+    retained trip and car state on the broker; a new fleetd would take that
+    trip over (docs/ELEVATOR.md 8). Start clean."""
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"e2e-clean-{uuid.uuid4().hex[:6]}")
+    c.connect("127.0.0.1", 1883)
+    c.loop_start()
+    for car in [e["id"] for e in ELEVATORS["elevators"]]:
+        for kind in ("trip", "state"):
+            c.publish(f"elevator/{car}/{kind}", b"", qos=1, retain=True).wait_for_publish(2)
+    c.loop_stop()
+    c.disconnect()
 
 
 def adapter_boot():

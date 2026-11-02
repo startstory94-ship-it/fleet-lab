@@ -183,7 +183,7 @@
 `drop_comms`를 8초마다 보내 robot_2를 STALE(흐린 점선 원) → OFFLINE(어두운 원에 X) → 복구; fleetd를 끄면 "연결 끊김" 띠와 두 배지 "끊김", 다시 켜면 띠가 사라지고 "서버가 다시 시작됨" 알림 뒤 새 서버의 이벤트가 처음부터 보임.
 확인하지 못한 것: 연결은 살아 있는데 서버가 멈춘 경우의 "응답 없음"(서버를 죽이면 소켓이 바로 닫혀서 재현 못 함, heartbeat 쪽은 Go 테스트로만), IN_ELEVATOR 그리기(6단계 전이라 mock이 보내지 않음).
 
-## 6단계: 목적층이 다른 로봇 함께 태우기 ⭐ (6a: 서버·sim·프로토콜)
+## 6단계: 목적층이 다른 로봇 함께 태우기 ⭐ (6a: 서버·sim·프로토콜, 6b: 실제 프로세스)
 
 6a는 서버 쪽만 한다: 계획 함수, 운행 지휘, 작업 단계 연결, `internal/sim`의 엘리베이터와 탑승 로봇, 규약 문서 [ELEVATOR.md](ELEVATOR.md).
 ROS mock 로봇·어댑터·mock 엘리베이터·대시보드·e2e는 6b(이 문서대로 구현). 아래 테스트는 모두 가짜 시계라 1초 안에 끝난다.
@@ -243,7 +243,7 @@ ROS mock 로봇·어댑터·mock 엘리베이터·대시보드·e2e는 6b(이 �
 | 예고보다 늦은 와이파이 / 훨씬 늦음 | ✅ `TestRideLinkLaterThanAnnounced`, `TestRideLinkLostAfterExit` | STALE만·같은 로봇 완료 / OFFLINE → 다른 로봇(시도 1) |
 | 작업 10개·로봇 4대 | ✅ `TestRideMixedLoad` | 모두 DONE·시도 0, 함께 탄 운행 1번 이상 |
 | 시드 반복 | ✅ 수동 | 임시 테스트로 시드 60개 × 2종(지연, 응답 15% 유실 + 하차 실패 + 엉뚱한 층): 모두 완료, 문 구역 최대 1대 |
-| 실제 환경 | ⬜ 6b | |
+| 실제 환경 | ✅ 6b (아래) | |
 | 🔧 엘리베이터 벤더 어댑터 2종 | 🔧 | 6b 이후 |
 
 ### 변이 실험 (6a)
@@ -282,6 +282,37 @@ ROS mock 로봇·어댑터·mock 엘리베이터·대시보드·e2e는 6b(이 �
 `cancel.target` 없음, outbox 운행 재시도·대체 없음, 설정 0·hold 순서) + 1차 변이 23개 다시: 모두 적어도 한 테스트가 실패.
 sim 쪽에서 처음 살아남은 2개(문 구역 확인 없이 turn, turn 재전송 없음)는 sim 테스트를 강하게 해서(문 이동 40초, turn 2번 유실) 잡음.
 살아남은 1개는 동치: `RestoreTrip`의 "자기 boot면 무시"는 이제 "끝난 운행 무시 + 운행 중이면 무시"에 포함된다(이 실행의 운행은 진행 중이거나 끝났거나 둘 중 하나).
+
+### 6b: 실제 프로세스 (mock 엘리베이터·ROS mock 로봇·어댑터·대시보드·e2e)
+
+| 테스트 | 상태 | 리뷰 |
+|---|---|---|
+| mock 엘리베이터 동작 (`cmd/mockelevator/car_test.go`) | ✅ 5개(+ 리뷰 4개 = 9개) | `call` 열고 `hold_s` 뒤 닫힘(예약은 남음), `goto`는 문 구역에 로봇이 있으면 떠나지 않음·`door_zone` 즉시 발행·지나는 층 상태, `door_zone`은 로봇 이름 집합(중복 `enter`·들어온 적 없는 `clear`·두 번 온 `clear`), 문 막힘 +1, `hold`는 닫힌 문을 다시 열지 않음·같은 `cmd_id` 한 번·같은 층 `goto`로 다시 엶·다른 운행 `hold` 무시·`release`, 응답 없음은 명령 무시·발행 0, 1초마다 상태 |
+| 어댑터 탑승 절차 (`adapter/test_ride_logic.py`, `RobotRide`) | ✅ 29개(+ 리뷰 13개 = 42개) | 수락 조건 7가지(계획 없음·잘못된 계획·ERROR·다른 층·로비에서 멂·차 안·상태 모름), 대기 중 새 ride가 옛것을 `cancelled`, 탑승 시작 뒤 새 ride 거절, `cancel.target`: 지금 ride만·옛 ride 취소는 `failed`·탄 뒤 `failed`·ride와 무관하면 goto 규칙, `x`로 시작하는 실행 ID. 탑승 turn: 이벤트·`BOARDING`+`silence_s`·`enter`·이동 순서, 끊김 시작, 이벤트는 쌓임. 탑승 실패면 로비에서 와이파이 복귀. 다른 로봇·다른 운행·잘못된 turn 무시, 움직이는 중 같은 `n` 무시, 답한 `n`은 같은 답(같은 seq), 이미 한 일의 새 `n`은 `clear`, turn 유실 주입. 차 층 따라가기, 하차는 turn의 로비로, 1초 뒤 `pose`→`state`→이벤트(seq 순)→`done`(+층), 하차 실패면 칸에서 기다림(스스로 안 내림)·재시도·넘겨진 층에서 내림·`done` 층 5, `done` 뒤 turn 무시, 낡은 이동 보고 무시, seq는 운행을 넘어 계속 |
+| 대시보드 엘리베이터 (`scripts/web_test.js`) | ✅ 8개 추가(31개) | 칸별 로봇(나간·대기 로봇 제외, 넘겨짐 표시, 잘못된 칸 번호 무시), 차 안 로봇 → 차의 층, 칸 상자와 칸 위치(어댑터와 같은 값), 이벤트 detail 나누기, 경보(응답 없음·막힘·갇힘·임대·차례 시간 초과·이 운행의 overdue만·문 구역 2대·쉬는 중) |
+| e2e 함께 타기 (`scripts/e2e.py` `mixed_ride`) | ✅ 12단계 | 1층 `lift_1..3` → 3·7·5층 동시: 운행 **1번**, 계획 탑승 7·5·3·정차 [3 5 7], 실제 `zone clear` 순서 탑승 7·5·3 / 하차 3·5·7(각자 자기 층), 엘리베이터 상태를 계속 구독해 **`door_zone` 최대 1**(1인 상태를 실제로 봤는지·로봇들의 enter/clear로 따로 센 최대도 1), 3대 모두 `silence_s`를 보내고 IN_ELEVATOR, OFFLINE 0, **차 안에 있는 동안 그 로봇의 `fleet/*` 메시지 0개**, 로봇 이벤트 4개(`ride_accepted`·`boarding`·`boarded`·`exited`)가 seq 순이고 `boarded`·`exited`는 하차 뒤에 도착(쌓였다가 보냄)·fleetd가 `robot_event`로 기록, `done`의 `floor` = 목적층, 작업 DONE·로봇 층 3·5·7·재배정 없음, `released` 1번·운행 지워짐 |
+| e2e 하차 실패 (`exit_failure`) | ✅ 6단계 | `fx_1`, `fx_2` → 4·6층, 4층 하차 2번 실패(`--exit-fail-count 2`): 4층 `failed` 2번 → 넘겨져 6층에서 **넘겨진 로봇이 먼저**(문 쪽) → 다른 로봇, fleetd `exit_failed` 2번 이상·`replanned`("exits at floor 6"), `done` 층 6 → 다시 내려가는 운행 → `done` 층 4, 작업 둘 다 DONE·층 4·6·재배정 없음, `door_zone` 최대 1. 앞 시나리오의 로봇은 끝낸 뒤 프로세스를 끈다(위층의 놀고 있는 로봇이 층당 1000 m 가산으로도 더 가까워 작업을 가져가기 때문) |
+| 데모 | ✅ 수동 | `scripts\demo.bat` + `demo_tasks.ps1 up/down`: 브라우저에서 칸별 로봇·문 구역·단계·차 안 로봇 그림 확인 |
+
+**6b 구현 중 찾은 문제(고침):** ① 어댑터가 탑승 turn에서 끊김을 먼저 켠 뒤 `boarding` 이벤트를 보내려 해 이벤트가 사라짐(seq 2 빠짐) — e2e의 이벤트 이름 검사가 잡음. 순수 로직이 내준 이벤트는 바로 보내고, 끊긴 동안의 것은 로직이 쌓는다.
+② 처음 e2e에서 하차 실패 시나리오의 작업을 위층에 있던 앞 시나리오 로봇이 가져감(배정은 층 차이 × 1000 m) — 시나리오 로봇을 끝나면 내리게 고침. 서버 동작은 규칙대로다.
+
+### 6b 리뷰 (2026-11-03, 모두 수정함)
+
+리뷰어 증명: `test_review6b.py` 3개(잘못된 동작을 단언)와 `review6b_test.go` 2개. 뒤집어서 회귀 테스트로 넣었다.
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 중 | 차 안 로봇에게 exit turn이 끝내 안 오면(운영자 반환, retained 운행 유실) 영원히 끊김 | 차 안(`RIDING`, 움직임 없음)에서 그 운행이 지워지거나 `done`/`aborted`가 되거나 다른 운행으로 바뀌거나 60초 동안 소식이 없으면 끊김을 끝냄: `pose`(차의 층)·`state`·쌓인 이벤트 + `exit_failed` → ride `failed`(+`floor`), 꺼낼 때까지 `ERROR`("needs a human"). 꺼내면(`in_car: false`) `rescued`. 운행 중에 꺼내면 `rescued` 뒤 하차처럼 `done`. mock 로봇에 `rescue` 서비스(+ 어댑터 명령 `rescue`). 운영자 절차는 ELEVATOR.md 6장 | `test_review_trip_released_with_the_robot_inside`(원래 `test_no_way_out…`), `test_trip_cleared_or_replaced…`(3가지), `…before_boarding…`, `…during_a_move…`, `test_trip_not_heard_for_a_long_time_is_gone`, `test_rescued_while_the_trip_runs_comes_out_done`, 배선 `test_cleared_trip_ends_the_blackout_and_rescue_command`, e2e 갇힘 → 반환 → 꺼냄 |
+| 2 중 | `elevator_move` 유실·로봇 재시작이면 어댑터가 영원히 `BOARDING`+끊김 | 움직임 기한 `turn_timeout_s` + 30초(`--move-timeout-extra`). 넘으면 `failed`("robot did not finish the move"), 탑승이면 끊김을 끝내고 `WAITING_ELEVATOR`. 로봇이 그 움직임을 `running`으로 알리는 동안은 기다림(문 구역 안) | `test_review_board_move_never_reported_fails`(원래 `…waits_forever`), `test_slow_move_still_running_is_waited_for`, `test_exit_move_timeout…`, e2e 느린 문 |
+| 3 낮 | 새 `n`으로 움직이는 중에 옛 `n`의 turn이 늦게 오면 옛 답을 다시 보냄 → mock 엘리베이터가 문 구역에서 뺌 → 문이 로봇 위로 닫힐 수 있음 | 움직이는 중에는 모든 turn 무시. mock 엘리베이터는 같은 운행에서 그 로봇의 마지막 `enter`보다 작은 `n`의 답을 무시(운행이 바뀌면 다시 셈: e2e가 처음 고친 판을 잡음) | `test_review_old_n_is_not_answered…`(원래 `test_old_n_reanswer…`), `TestReviewStaleAnswerKeepsRobotInZone`, `TestZoneNumbersRestartPerTrip` |
+| 4 낮 | mock 로봇이 움직이다 고장 나면 문 구역 안에서 `failed`를 보고 → `door_zone` 0인데 문을 막고 있음 | 고장이면 그 자리에 멈추고 움직임은 `running`으로 남음(어댑터도 기다림). `reset_error`가 시작점으로 되돌린 뒤 `failed` | 어댑터 쪽 `test_slow_move_still_running_is_waited_for`(running이면 답 없음). mock 로봇 자체는 ROS라 자동 테스트 없음(수동 확인 안 함) |
+| 5 낮 | 닫힌 문 앞에서 로봇이 들어와도 다시 열지 않고, `door_zone` 1로 출발할 수 있음 | 서 있는 차는 `door_zone` > 0이면 닫힌·닫히는 문을 다시 열고, `door_zone` > 0이면 출발하지 않음 | `TestReviewEnterOnClosedDoorReopens`(goto 중에도 이동 없음), `TestReviewBlockedDoorNeverTravels` |
+| 6 낮 | 로비에 있는데 `exit` turn이 오면 아무 답 없음 | `failed`("not in the car"), 문서화 | `test_review_exit_turn_at_the_lobby_is_answered_failed` |
+| 테스트 | 어댑터 배선(`fleet_adapter.py`) 테스트 없음 | 가짜 rclpy·메시지·paho 모듈로 `FleetAdapter`를 띄움 | `test_adapter_wiring.py` 8개: 수락·구독, 탑승 turn의 순서(이벤트 → BOARDING 상태 → enter), 끊긴 동안 `fleet/*` 0(상태·위치·이벤트·응답), 끊긴 동안 명령 버림(명령 장부에도 없음), `run()` 순서, 내린 뒤 `pose`→`state`→`done`과 계획 없는 같은 `cmd_id`에 `done` 다시, 탑승 중 MQTT 재연결(구독 복구, 로봇 메시지 없음), 운행 지워짐 → ERROR + `rescue` 명령 |
+| e2e | 끊김 검사가 하차 `clear`까지만, 문 규칙을 엘리베이터 상태로 확인하지 않음, 운행이 정확히 1번이어야 해서 흔들릴 수 있음, 답을 원본 메시지 목록으로 셈 | 끊김은 `clear` + 1초까지, 첫 메시지가 0.9초 이상 뒤. 모든 `enter` 앞(앞 답 이후, ±0.25초: 다른 클라이언트라 도착 순서가 바뀔 수 있음)에 문 열림·`door_zone` 0·정지 상태, 이동 중 `door_zone` > 0 상태 없음, turn마다 `enter` 1번. 로봇을 로비 3~4.2 m에 두어 1초 안에 도착(모음 3초), "세 대를 모두 태운 운행"으로 검사. 답은 (운행, `n`)마다 첫 답. 시나리오마다 끝난 로봇을 내림. 시작할 때 브로커에 남은 retained 운행·상태를 지움(죽은 앞 실행의 `blocked` 운행을 새 fleetd가 이어받아 모든 시나리오가 멈춘 것을 겪음) | 엘리베이터 e2e 36단계 |
+
+**6b에서 하지 않은 것:** 엘리베이터 응답 없음·문 막힘은 주입 옵션만 있고 e2e 단계는 없다(`internal/sim`·`internal/elevator`의 Go 테스트와 `cmd/mockelevator` 테스트가 검사). 어댑터를 탑승 중 재시작하면 ride를 잃는다(로봇이 `in_car`이면 ERROR로 보고해 배정은 막지만 운행을 이어받지는 않음: 사람이 꺼내야 함). 서버 재시작 중 탑승 e2e 없음. mock 로봇의 "움직이다 고장" 처리(리뷰 4)는 자동 테스트가 없다.
 
 ## 7단계: 마무리 (계획)
 
