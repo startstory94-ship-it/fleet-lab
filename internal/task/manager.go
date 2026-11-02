@@ -199,6 +199,9 @@ func (m *Manager) Submit(wps []Waypoint) (Task, error) {
 		if !finite(w.X) || !finite(w.Y) {
 			return Task{}, fmt.Errorf("%w: waypoint %d is not a finite number", ErrInvalid, i)
 		}
+		if math.Abs(w.X) > fleet.MaxCoord || math.Abs(w.Y) > fleet.MaxCoord {
+			return Task{}, fmt.Errorf("%w: waypoint %d (%g, %g) outside ±%g m", ErrInvalid, i, w.X, w.Y, float64(fleet.MaxCoord))
+		}
 	}
 	m.mu.Lock()
 	m.nextSeq++ // never handed out again in this run, even if the save fails

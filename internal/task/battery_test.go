@@ -593,3 +593,35 @@ func TestDockAckIgnoredByTasks(t *testing.T) {
 		t.Fatalf("%d docks; a refused dock waits for DockTimeout", n)
 	}
 }
+
+// NeedsCharge shows the policy's flag, hysteresis included: set below 25 %,
+// still set at 60 %, cleared at 90 %.
+func TestNeedsChargeExposesFlag(t *testing.T) {
+	h := newHarness(t, DefaultConfig(), idle("a", 0, 0), idle("b", 5, 0))
+	h.tick()
+	if got := h.m.NeedsCharge(); len(got) != 0 {
+		t.Fatalf("NeedsCharge = %v, want none", got)
+	}
+	for _, step := range []struct {
+		battery float64
+		want    bool
+	}{{24, true}, {60, true}, {89.9, true}, {90, false}} {
+		h.robot("a").Battery = step.battery
+		h.tick()
+		got := h.m.NeedsCharge()
+		if got["a"] != step.want || got["b"] {
+			t.Fatalf("at %.1f%% NeedsCharge = %v, want a=%v only", step.battery, got, step.want)
+		}
+	}
+}
+
+// Before the policy has judged a robot (no Tick yet, e.g. right after a
+// restart) its battery alone decides.
+func TestNeedsChargeBeforeFirstTick(t *testing.T) {
+	low := idle("low", 0, 0)
+	low.Battery = 20
+	h := newHarness(t, DefaultConfig(), low, idle("ok", 5, 0))
+	if got := h.m.NeedsCharge(); !got["low"] || got["ok"] {
+		t.Fatalf("NeedsCharge before any tick = %v, want low only", got)
+	}
+}

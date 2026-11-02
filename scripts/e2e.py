@@ -8,15 +8,23 @@ Needs: Mosquitto on 127.0.0.1:1883, Go on PATH, and a shell where ROS 2 is
 set up (pixi shell + local_setup.bat). Use scripts\\e2e.bat on Windows.
 """
 
+import base64
+import hashlib
 import json
 import os
+import re
+import socket
+import statistics
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime
 
 import paho.mqtt.client as mqtt
 
@@ -234,7 +242,10 @@ def run(m, procs, restart_fleetd, start_mock):
     # 11. battery policy
     battery_steps(start_mock)
 
-    # 12. adapter crash -> LWT -> all OFFLINE. kill() is a hard kill (no clean
+    # 12. dashboard and live frames
+    live_steps()
+
+    # 13. adapter crash -> LWT -> all OFFLINE. kill() is a hard kill (no clean
     # "offline" message), so only the broker's LWT can report it.
     procs["adapter"].kill()
     step("adapter crash takes all robots OFFLINE",
@@ -347,6 +358,176 @@ def battery_scenario(bat, x0, tail):
             bad.append(e.get("task"))
     step("no task assigned to bat_1 while it needed charge", not tail.gap and not bad,
          bad or "events were dropped before they were read")
+
+
+class WebSocket:
+    """Minimal RFC 6455 client, enough for /ws/live: no extensions (so no
+    compression), text messages, fragments joined, pings answered. The pixi
+    environment has no WebSocket library."""
+
+    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, url, timeout=5.0):
+        u = urllib.parse.urlsplit(url)
+        self.sock = socket.create_connection((u.hostname, u.port or 80), timeout=timeout)
+        self.buf = b""
+        self.partial = b""  # fragments of a message not finished yet
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {u.path or '/'} HTTP/1.1\r\nHost: {u.netloc}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        while b"\r\n\r\n" not in self.buf:
+            self._fill()
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        headers = {k.strip().lower(): v.strip() for k, v in (ln.split(":", 1) for ln in lines[1:] if ":" in ln)}
+        accept = base64.b64encode(hashlib.sha1((key + self.GUID).encode()).digest()).decode()
+        if lines[0].split()[1:2] != ["101"] or headers.get("sec-websocket-accept") != accept:
+            raise ConnectionError(f"handshake failed: {lines[0]}")
+
+    def _fill(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("connection closed")
+        self.buf += chunk
+
+    def _send(self, opcode, payload=b""):
+        mask = os.urandom(4)
+        n = len(payload)
+        head = bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 1 << 16:
+            head += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            head += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _frame(self):
+        """Takes one whole frame off the buffer, or returns None (nothing
+        consumed) if it has not fully arrived. A timeout while waiting for the
+        rest of a frame therefore never loses its header."""
+        buf = self.buf
+        if len(buf) < 2:
+            return None
+        b0, b1 = buf[0], buf[1]
+        n, pos = b1 & 0x7F, 2
+        if n == 126:
+            if len(buf) < 4:
+                return None
+            n, pos = struct.unpack(">H", buf[2:4])[0], 4
+        elif n == 127:
+            if len(buf) < 10:
+                return None
+            n, pos = struct.unpack(">Q", buf[2:10])[0], 10
+        mask = None
+        if b1 & 0x80:
+            if len(buf) < pos + 4:
+                return None
+            mask, pos = buf[pos:pos + 4], pos + 4
+        if len(buf) < pos + n:
+            return None
+        data, self.buf = buf[pos:pos + n], buf[pos + n:]
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        return b0 & 0x80, b0 & 0x0F, data
+
+    def recv(self):
+        """Returns the next text message. Raises socket.timeout if none has
+        fully arrived; buffered bytes and a partly received fragmented message
+        are kept for the next call."""
+        while True:
+            f = self._frame()
+            if f is None:
+                self._fill()
+                continue
+            fin, opcode, data = f
+            if opcode == 0x8:
+                raise ConnectionError("closed by server")
+            if opcode == 0x9:
+                self._send(0xA, data)
+                continue
+            if opcode == 0xA:
+                continue
+            self.partial += data
+            if fin:
+                msg, self.partial = self.partial, b""
+                return msg.decode()
+
+    def close(self):
+        try:
+            self._send(0x8, struct.pack(">H", 1000))
+        except OSError:
+            pass
+        self.sock.close()
+
+
+def server_time(s):
+    """Parses Go's RFC 3339 time (nanoseconds, Z or offset) to unix seconds."""
+    m = re.match(r"(.*T\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$", s)
+    frac = (m.group(2) or ".0")[:7]
+    tz = "+00:00" if m.group(3) == "Z" else m.group(3)
+    return datetime.fromisoformat(m.group(1) + frac + tz).timestamp()
+
+
+def live_steps():
+    try:
+        with urllib.request.urlopen(API + "/", timeout=2) as r:
+            body, ctype, code = r.read(), r.headers.get("Content-Type", ""), r.status
+    except Exception as e:
+        body, ctype, code = b"", str(e), 0
+    step("GET / serves the dashboard", code == 200 and ctype.startswith("text/html") and b"<canvas" in body,
+         (code, ctype))
+
+    everyone = sorted(r["name"] for r in http_json("/robots"))
+    try:
+        ws = WebSocket(API.replace("http://", "ws://") + "/ws/live")
+    except Exception as e:
+        step("/ws/live first frame is a snapshot of every robot", False, e)
+        return
+    try:
+        live_scenario(ws, everyone)
+    finally:
+        ws.close()
+
+
+def live_scenario(ws, everyone):
+    first = json.loads(ws.recv())
+    got = sorted(r["name"] for r in first["robots"])
+    step("/ws/live first frame is a snapshot of every robot", first["type"] == "snapshot" and got == everyone,
+         (first["type"], got, everyone))
+
+    # A task far from the docks: whoever takes it drives for several seconds.
+    tid = post_json("/tasks", {"waypoints": [{"x": 4.0, "y": 20.0, "floor": 1}]})["id"]
+    frames, end = [first], time.monotonic() + 5
+    ws.sock.settimeout(0.5)
+    while time.monotonic() < end:
+        try:
+            frames.append(json.loads(ws.recv()))
+        except socket.timeout:
+            pass
+    name = (task(tid) or {}).get("robot")
+    samples = [(server_time(f["time"]), r["x"], r["y"]) for f in frames[1:]
+               for r in f["robots"] if r["name"] == name]
+    moving = [s for s, prev in zip(samples[1:], samples) if (s[1], s[2]) != (prev[1], prev[2])]
+    moved = samples and ((samples[-1][1] - samples[0][1]) ** 2 + (samples[-1][2] - samples[0][2]) ** 2) ** 0.5
+    step("moving robot shows changing x/y across frames", bool(name) and len(moving) >= 10 and moved > 1.5,
+         (name, len(moving), moved))
+
+    # Frames come every ~150 ms while it moves, numbered without gaps.
+    gaps = [b[0] - a[0] for a, b in zip(samples, samples[1:])]
+    median = statistics.median(gaps) if gaps else 0
+    seqs = [f["seq"] for f in frames]
+    print(f"      ({name}: {len(moving)} moves in {len(frames) - 1} frames, median gap {median * 1000:.0f} ms)", flush=True)
+    # A heartbeat (nothing changed for 2 s) repeats the seq; a delta adds one.
+    in_order = all(f["type"] in ("delta", "heartbeat") for f in frames[1:]) and all(
+        b["seq"] == a["seq"] + (b["type"] == "delta") for a, b in zip(frames, frames[1:]))
+    step("frames ~150 ms apart, seq without gaps", 0.1 <= median <= 0.35 and in_order,
+         (f"median {median:.3f}s", seqs[:12]))
+    try:
+        post_json(f"/tasks/{tid}/cancel", {})
+    except Exception:
+        pass  # already finished
 
 
 def adapter_boot():

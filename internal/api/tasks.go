@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"slices"
 
 	"fleetlab/internal/task"
@@ -13,8 +15,35 @@ import (
 
 const maxBody = 1 << 20
 
+// sameSiteJSON guards the POST endpoints against other web sites. A page on
+// another site can make the browser send a "simple" cross-site POST (form or
+// text/plain fetch) without asking; requiring application/json forces a CORS
+// preflight, which this server never answers. Browsers that say where the
+// request comes from (Sec-Fetch-Site, Origin) are also checked directly.
+// Non-browser clients (curl, the e2e script) send neither header.
+func sameSiteJSON(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" || site == "same-site" {
+			writeError(w, http.StatusForbidden, "cross-site request refused")
+			return
+		}
+		if o := r.Header.Get("Origin"); o != "" {
+			u, err := url.Parse(o)
+			if err != nil || u.Host != r.Host {
+				writeError(w, http.StatusForbidden, "request from another origin refused")
+				return
+			}
+		}
+		if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+			writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+			return
+		}
+		h(w, r)
+	}
+}
+
 func routeTasks(mux *http.ServeMux, tasks Tasks) {
-	mux.HandleFunc("POST /tasks", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /tasks", sameSiteJSON(func(w http.ResponseWriter, r *http.Request) {
 		wps, err := decodeWaypoints(http.MaxBytesReader(w, r.Body, maxBody))
 		if tooBig := new(http.MaxBytesError); errors.As(err, &tooBig) {
 			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("body over %d bytes", tooBig.Limit))
@@ -34,7 +63,7 @@ func routeTasks(mux *http.ServeMux, tasks Tasks) {
 			return
 		}
 		writeJSON(w, http.StatusCreated, t)
-	})
+	}))
 	mux.HandleFunc("GET /tasks", func(w http.ResponseWriter, r *http.Request) {
 		state := r.URL.Query().Get("state")
 		if state != "" && !slices.Contains(task.States, state) {
@@ -51,7 +80,7 @@ func routeTasks(mux *http.ServeMux, tasks Tasks) {
 		}
 		writeJSON(w, http.StatusOK, t)
 	})
-	mux.HandleFunc("POST /tasks/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /tasks/{id}/cancel", sameSiteJSON(func(w http.ResponseWriter, r *http.Request) {
 		t, err := tasks.Cancel(r.PathValue("id"))
 		switch {
 		case errors.Is(err, task.ErrNotFound):
@@ -63,7 +92,7 @@ func routeTasks(mux *http.ServeMux, tasks Tasks) {
 		default:
 			writeJSON(w, http.StatusOK, t)
 		}
-	})
+	}))
 }
 
 // decodeWaypoints reads {"waypoints":[{"x":..,"y":..,"floor":..}]}. Every

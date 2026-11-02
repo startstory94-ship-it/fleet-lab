@@ -3,9 +3,11 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"path"
 	"strconv"
 	"time"
 
@@ -14,7 +16,9 @@ import (
 
 	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
+	"fleetlab/internal/live"
 	"fleetlab/internal/task"
+	"fleetlab/web"
 )
 
 // Tasks is the task manager as the API sees it (task.Manager).
@@ -25,9 +29,25 @@ type Tasks interface {
 	Cancel(id string) (task.Task, error)
 }
 
-func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, log *slog.Logger) http.Handler {
+// New builds the HTTP handler. frames may be nil; /ws/live then answers 503.
+func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, frames *live.Broadcaster, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	routeTasks(mux, tasks)
+	routeDashboard(mux)
+	mux.HandleFunc("GET /ws/live", func(w http.ResponseWriter, r *http.Request) {
+		if frames == nil {
+			writeError(w, http.StatusServiceUnavailable, "live frames are off")
+			return
+		}
+		serveLive(w, r, frames, log)
+	})
+	mux.HandleFunc("GET /live/stats", func(w http.ResponseWriter, r *http.Request) {
+		if frames == nil {
+			writeError(w, http.StatusServiceUnavailable, "live frames are off")
+			return
+		}
+		writeJSON(w, http.StatusOK, frames.Stats())
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	})
@@ -58,8 +78,17 @@ func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, log *slog.Logger) http
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
 		serveEvents(w, r, hub, log)
 	})
-	return mux
+	// Event numbers start again at 1 when fleetd restarts. Every response
+	// carries this run's id so a client can tell a restart from more events.
+	boot := rand.Text()[:10]
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(BootHeader, boot)
+		mux.ServeHTTP(w, r)
+	})
 }
+
+// BootHeader names the response header holding the server run's id.
+const BootHeader = "X-Fleetd-Boot"
 
 // serveEvents streams live events to one WebSocket client.
 func serveEvents(w http.ResponseWriter, r *http.Request, hub *events.Hub, log *slog.Logger) {
@@ -81,13 +110,79 @@ func serveEvents(w http.ResponseWriter, r *http.Request, hub *events.Hub, log *s
 			}
 			return
 		case e := <-sub.C:
-			wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			wctx, cancel := context.WithTimeout(ctx, writeTimeout)
 			err := wsjson.Write(wctx, c, e)
 			cancel()
 			if err != nil {
 				return
 			}
 		}
+	}
+}
+
+// writeTimeout bounds one WebSocket write. A client that cannot take a frame
+// in this time is closed; until then the broadcaster drops frames for it
+// without waiting. A variable so tests can shorten it.
+var writeTimeout = 5 * time.Second
+
+// serveLive streams position frames to one WebSocket client. The bytes are
+// the broadcaster's, shared with every other client; they are only written.
+// Beyond the broadcaster's subscriber limit it answers 503 before upgrading.
+// (websocket.Accept also refuses a browser page from another origin.)
+func serveLive(w http.ResponseWriter, r *http.Request, frames *live.Broadcaster, log *slog.Logger) {
+	sub, unsubscribe, err := frames.Subscribe()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	defer unsubscribe()
+	c, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer c.CloseNow()
+
+	ctx := c.CloseRead(r.Context())
+	for {
+		data, err := sub.Next(ctx)
+		if err != nil {
+			if d := sub.Dropped(); d > 0 {
+				log.Info("live client gone", "dropped_frames", d, "resyncs", sub.Resyncs())
+			}
+			return
+		}
+		wctx, cancel := context.WithTimeout(ctx, writeTimeout)
+		err = c.Write(wctx, websocket.MessageText, data)
+		cancel()
+		if err != nil {
+			log.Info("live client write failed; closing", "err", err, "dropped_frames", sub.Dropped())
+			return
+		}
+	}
+}
+
+// routeDashboard serves web/ at /. Content types are set from the file
+// extension here rather than by the OS table (on Windows the registry can map
+// .js to text/plain, which browsers refuse to run as a module or script).
+func routeDashboard(mux *http.ServeMux) {
+	files := http.FileServerFS(web.FS)
+	types := map[string]string{
+		".html": "text/html; charset=utf-8",
+		".js":   "text/javascript; charset=utf-8",
+		".css":  "text/css; charset=utf-8",
+	}
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", types[".html"])
+		w.Header().Set("Cache-Control", "no-cache")
+		files.ServeHTTP(w, r)
+	})
+	for _, name := range []string{"app.js", "style.css"} {
+		ct := types[path.Ext(name)]
+		mux.HandleFunc("GET /"+name, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", ct)
+			w.Header().Set("Cache-Control", "no-cache")
+			files.ServeHTTP(w, r)
+		})
 	}
 }
 

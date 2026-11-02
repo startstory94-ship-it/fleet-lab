@@ -68,6 +68,24 @@ func (m *Manager) needsCharge(r fleet.Robot) bool {
 	return r.Mode != "" && r.Battery < m.cfg.LowBattery
 }
 
+// NeedsCharge returns the robots that need charge right now (the policy's
+// flag, or for robots it has not judged yet their battery alone). It is
+// read-only. The robots are read before the manager lock is taken, so a
+// caller holding no lock never nests the two; the manager's own Tick nests
+// manager -> registry, never the other way.
+func (m *Manager) NeedsCharge() map[string]bool {
+	robots := m.d.Robots.Snapshot()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]bool)
+	for _, r := range robots {
+		if m.needsCharge(r) {
+			out[r.Name] = true
+		}
+	}
+	return out
+}
+
 // dockMayLand reports whether a dock sent to the robot may still arrive. A
 // goto sent now could be ended by it ("cancelled"), costing an attempt.
 func (m *Manager) dockMayLand(robot string, now time.Time) bool {
