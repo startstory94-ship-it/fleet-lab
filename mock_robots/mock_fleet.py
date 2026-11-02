@@ -58,7 +58,8 @@ def quat_to_yaw(q):
 
 
 class MockRobot(Node):
-    def __init__(self, name, x, y, speed, battery, fault_rate, drop_seconds):
+    def __init__(self, name, x, y, speed, battery, fault_rate, drop_seconds,
+                 roam_rate=0.0, roam_max=4.0):
         super().__init__("mock_robot", namespace=name)
         self.name = name
         self.x, self.y, self.yaw = x, y, 0.0
@@ -67,6 +68,8 @@ class MockRobot(Node):
         self.battery = battery
         self.fault_rate = fault_rate          # faults per minute (Poisson)
         self.drop_seconds = drop_seconds
+        self.roam_rate = roam_rate            # Wi-Fi roaming gaps per minute (Poisson)
+        self.roam_max = roam_max              # longest roaming gap, s
         self.mode = IDLE
         self.goal = None                      # (x, y, yaw) or None
         self.error = ""
@@ -151,6 +154,12 @@ class MockRobot(Node):
             self.fail("simulated_fault")
         if self.battery <= 0.0 and self.mode in (MOVING, DOCKING):
             self.fail("battery_empty")
+
+        if self.roam_rate > 0.0 and self.comms_up() and \
+                random.random() < self.roam_rate * TICK / 60.0:
+            gap = random.uniform(0.5, self.roam_max)
+            self.comms_down_until = time.monotonic() + gap
+            self.get_logger().info(f"roaming gap {gap:.1f}s")
 
         self.publish_odom()
 
@@ -240,6 +249,9 @@ def main():
     ap.add_argument("--spacing", type=float, default=2.0, help="m between docks on the x axis")
     ap.add_argument("--fault-rate", type=float, default=0.0, help="random faults per robot per minute")
     ap.add_argument("--drop-seconds", type=float, default=10.0, help="silence length for drop_comms")
+    ap.add_argument("--roam-rate", type=float, default=0.0,
+                    help="random Wi-Fi roaming gaps per robot per minute")
+    ap.add_argument("--roam-max", type=float, default=4.0, help="longest roaming gap in seconds (min 0.5)")
     ap.add_argument("--seed", type=int, default=None)
     args, ros_args = ap.parse_known_args()
     random.seed(args.seed)
@@ -247,7 +259,8 @@ def main():
     rclpy.init(args=ros_args)
     robots = [MockRobot(f"{args.prefix}_{i + 1}", x=i * args.spacing, y=0.0,
                         speed=args.speed, battery=random.uniform(60.0, 100.0),
-                        fault_rate=args.fault_rate, drop_seconds=args.drop_seconds)
+                        fault_rate=args.fault_rate, drop_seconds=args.drop_seconds,
+                        roam_rate=args.roam_rate, roam_max=args.roam_max)
               for i in range(args.count)]
     executor = MultiThreadedExecutor()
     for r in robots:

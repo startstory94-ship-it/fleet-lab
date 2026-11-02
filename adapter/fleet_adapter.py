@@ -48,6 +48,7 @@ POSE_DEADBAND_M = 0.05
 POSE_DEADBAND_RAD = math.radians(2.0)
 STATE_PERIOD = 1.0         # s, state heartbeat
 DISCOVERY_PERIOD = 2.0     # s
+ROBOT_SILENT_AFTER = 1.5   # s without robot_state -> stop forwarding (robot_state is 2 Hz)
 KEEPALIVE = 5              # s, MQTT keepalive
 SERVICE_CMDS = ("cancel", "dock", "reset_error", "drop_comms")
 SEEN_CMD_IDS = 256         # per robot, for duplicate suppression
@@ -72,6 +73,7 @@ class RobotBridge:
         self.state = None           # dict from robot_state
         self.last_pose_sent = None  # (time, x, y, yaw)
         self.last_state_sent = None # (time, key)
+        self.last_rx = 0.0          # monotonic time of the last robot_state
         self.seen_cmds = collections.OrderedDict()
 
         state_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -92,7 +94,13 @@ class RobotBridge:
         try:
             self.state = json.loads(msg.data)
         except ValueError:
-            pass
+            return
+        self.last_rx = time.monotonic()
+
+    def is_live(self, now):
+        """Only forward while the robot itself is publishing. Re-sending cached
+        data would hide a silent robot from the server's liveness check."""
+        return self.state is not None and now - self.last_rx <= ROBOT_SILENT_AFTER
 
     def remember_cmd(self, cmd_id):
         """Return False if cmd_id was already handled (QoS 1 may redeliver)."""
@@ -166,7 +174,7 @@ class FleetAdapter(Node):
     def publish_poses(self):
         now = time.monotonic()
         for r in self.robots.values():
-            if r.pose is None or r.state is None:
+            if r.pose is None or not r.is_live(now):
                 continue
             x, y, yaw, v, frame = r.pose
             if r.last_pose_sent is not None:
@@ -186,10 +194,10 @@ class FleetAdapter(Node):
     def publish_states(self):
         now = time.monotonic()
         for r in self.robots.values():
-            s = r.state
-            if s is None:
+            if not r.is_live(now):
                 continue
-            key = (s.get("mode"), s.get("error"), s.get("task_id", ""))
+            s = r.state
+            key = (s.get("mode"), s.get("error"), s.get("task_id", ""), s.get("silence_s", 0))
             if r.last_state_sent is not None:
                 t0, key0 = r.last_state_sent
                 if key == key0 and now - t0 < STATE_PERIOD:
@@ -198,8 +206,10 @@ class FleetAdapter(Node):
             r.last_state_sent = (now, key)
             self.send(f"fleet/{r.name}/state", {
                 "boot": self.boot, "seq": r.state_seq, "stamp": time.time(),
+                "host": self.host_id,
                 "mode": s.get("mode"), "battery": s.get("battery"),
                 "task_id": s.get("task_id", ""), "error": s.get("error", ""),
+                "silence_s": s.get("silence_s", 0),
             }, qos=1)
 
     # ---- MQTT -> ROS 2 ----

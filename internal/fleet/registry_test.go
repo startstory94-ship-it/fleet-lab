@@ -6,10 +6,17 @@ import (
 )
 
 func newTestRegistry() (*Registry, *time.Time) {
+	g, now, _ := newRecordingRegistry()
+	return g, now
+}
+
+// newRecordingRegistry returns a registry on a fake clock that records events.
+func newRecordingRegistry() (*Registry, *time.Time, *[]Event) {
 	now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
-	g := NewRegistry()
+	var evs []Event
+	g := NewRegistry(DefaultConfig(), func(e Event) { evs = append(evs, e) })
 	g.now = func() time.Time { return now }
-	return g, &now
+	return g, &now, &evs
 }
 
 func TestApplyPoseDropsStaleAndDuplicate(t *testing.T) {
