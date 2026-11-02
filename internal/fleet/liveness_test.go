@@ -1,6 +1,8 @@
 package fleet
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -200,13 +202,111 @@ func TestModeAndErrorEvents(t *testing.T) {
 	for _, e := range *evs {
 		got = append(got, e.Type+":"+e.To)
 	}
-	want := []string{"mode:IDLE", "mode:ERROR", "error:simulated_fault"}
+	want := []string{"seen:", "mode:ERROR", "error:simulated_fault"}
 	if len(got) != len(want) {
 		t.Fatalf("events = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("events = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestRecoveryFromOffline(t *testing.T) {
+	g, now, _ := newRecordingRegistry()
+	f := &feeder{g: g, name: "r1"}
+	f.heartbeat()
+	advance(g, now, 25*time.Second)
+	if c := conn(t, g, "r1"); c != Offline {
+		t.Fatalf("setup: %s, want OFFLINE", c)
+	}
+	f.heartbeat()
+	f.heartbeat()
+	if c := conn(t, g, "r1"); c != Offline {
+		t.Fatalf("after 2 messages: %s, want OFFLINE", c)
+	}
+	f.heartbeat()
+	if c := conn(t, g, "r1"); c != Online {
+		t.Fatalf("after 3 messages: %s, want ONLINE", c)
+	}
+}
+
+func TestRecoveryAfterAdapterRestart(t *testing.T) {
+	g, _, _ := newRecordingRegistry()
+	(&feeder{g: g, name: "r1"}).heartbeat()
+	g.AdapterOffline("pc1")
+
+	// The restarted adapter has a new boot id and starts seq from 1.
+	for seq := uint64(1); seq <= 3; seq++ {
+		if !g.ApplyState("r1", StateMsg{Boot: "new", Seq: seq, Host: "pc1", Mode: "IDLE"}) {
+			t.Fatalf("message %d after restart rejected", seq)
+		}
+	}
+	if c := conn(t, g, "r1"); c != Online {
+		t.Fatalf("after restart: %s, want ONLINE", c)
+	}
+}
+
+func TestRepeatedAnnouncementExtendsBlackout(t *testing.T) {
+	g, now, evs := newRecordingRegistry()
+	f := &feeder{g: g, name: "r1"}
+	f.state(StateMsg{Mode: "BOARDING", SilenceS: 30})
+	advance(g, now, 20*time.Second)
+	f.state(StateMsg{Mode: "RIDING", SilenceS: 30}) // deadline is now 30 s from here
+	advance(g, now, 20*time.Second)                 // 40 s after the first announcement
+	if c := conn(t, g, "r1"); c != InElevator {
+		t.Fatalf("%s, want IN_ELEVATOR: a repeated announcement must extend the deadline", c)
+	}
+	for _, e := range *evs {
+		if e.Type == "elevator_overdue" {
+			t.Fatal("unexpected elevator_overdue")
+		}
+	}
+}
+
+func TestPoseCarriesHostForAdapterOffline(t *testing.T) {
+	g, _, _ := newRecordingRegistry()
+	// Only a pose has arrived so far; it must still tie the robot to its adapter.
+	g.ApplyPose("r1", PoseMsg{Boot: "b", Seq: 1, Host: "pc1"})
+	g.AdapterOffline("pc1")
+	if c := conn(t, g, "r1"); c != Offline {
+		t.Fatalf("%s, want OFFLINE", c)
+	}
+}
+
+func TestEventSeqIsOrderedUnderConcurrency(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seqs []uint64
+	)
+	g := NewRegistry(Config{StaleAfter: time.Nanosecond, OfflineAfter: time.Millisecond, RecoverMsgs: 1},
+		func(e Event) {
+			mu.Lock()
+			seqs = append(seqs, e.Seq)
+			mu.Unlock()
+		})
+
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			name := fmt.Sprintf("r%d", w)
+			for i := 1; i <= 500; i++ {
+				g.ApplyState(name, StateMsg{Boot: "b", Seq: uint64(i), Mode: []string{"IDLE", "MOVING"}[i%2]})
+				g.Tick()
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if len(seqs) == 0 {
+		t.Fatal("no events")
+	}
+	for i, s := range seqs {
+		if s != uint64(i+1) {
+			t.Fatalf("event %d delivered with seq %d: events reached the listener out of order", i, s)
 		}
 	}
 }

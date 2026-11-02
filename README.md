@@ -50,6 +50,19 @@ mosquitto_pub -t fleet/robot_1/cmd -q 1 -m "{\"cmd_id\":\"c1\",\"type\":\"goto\"
 ```
 
 명령 종류: `goto`(x, y, yaw), `cancel`, `dock`, `reset_error`, `drop_comms`. 결과는 `fleet/<robot>/cmd_ack`로 온다.
+`goto`는 `accepted` 뒤에 `done` / `failed` / `cancelled`가 한 번 더 온다. 수행 중에는 로봇 상태의 `task_id`가 그 `cmd_id`다.
+같은 `cmd_id`를 다시 보내면 실행하지 않고 마지막 응답을 다시 보낸다.
+
+## 테스트
+
+```bat
+go test ./...
+cd C:\pixi_ws && pixi run python -m pytest C:\Users\han\Documents\fleet-lab\adapter
+scripts\e2e.bat
+```
+
+`e2e.bat`은 서버·mock 로봇·어댑터를 실제로 띄워 시나리오 17개를 돌린다(약 1분, Mosquitto 필요).
+테스트 목록과 리뷰는 [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
 
 ## API
 

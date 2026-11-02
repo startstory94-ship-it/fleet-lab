@@ -12,6 +12,7 @@ type PoseMsg struct {
 	Boot  string  `json:"boot"`
 	Seq   uint64  `json:"seq"`
 	Stamp float64 `json:"stamp"`
+	Host  string  `json:"host"`
 	Frame string  `json:"frame"`
 	Floor int     `json:"floor"`
 	X     float64 `json:"x"`
@@ -46,9 +47,12 @@ const (
 
 // Event is a change worth telling operators about.
 type Event struct {
+	// Seq increases by one per event, in the order the changes happened.
+	// Listeners can use it to spot gaps (dropped events) or reordering.
+	Seq    uint64    `json:"seq"`
 	Time   time.Time `json:"time"`
 	Robot  string    `json:"robot"`
-	Type   string    `json:"type"` // conn, mode, error, elevator_overdue, adapter
+	Type   string    `json:"type"` // seen, conn, mode, error, elevator_overdue, adapter
 	From   string    `json:"from,omitempty"`
 	To     string    `json:"to,omitempty"`
 	Detail string    `json:"detail,omitempty"`
@@ -99,10 +103,12 @@ type Registry struct {
 	cfg    Config
 	now    func() time.Time
 	emit   func(Event)
+	evSeq  uint64
 }
 
-// NewRegistry creates a registry. emit receives events outside the lock; it
-// must not block. It may be nil.
+// NewRegistry creates a registry. emit is called with the registry lock held,
+// so events reach it in the order the changes happened; it must not block or
+// call back into the registry. It may be nil.
 func NewRegistry(cfg Config, emit func(Event)) *Registry {
 	if emit == nil {
 		emit = func(Event) {}
@@ -110,17 +116,22 @@ func NewRegistry(cfg Config, emit func(Event)) *Registry {
 	return &Registry{robots: make(map[string]*Robot), cfg: cfg, now: time.Now, emit: emit}
 }
 
-func (g *Registry) get(name string) *Robot {
+// get returns the robot, creating it (with a "seen" event) on first contact.
+func (g *Registry) get(name string, now time.Time, evs []Event) (*Robot, []Event) {
 	r, ok := g.robots[name]
 	if !ok {
 		r = &Robot{Name: name, Conn: Online}
 		g.robots[name] = r
+		evs = append(evs, Event{Time: now, Robot: name, Type: "seen"})
 	}
-	return r
+	return r, evs
 }
 
+// flush numbers and emits events. Call it before releasing the lock.
 func (g *Registry) flush(evs []Event) {
 	for _, e := range evs {
+		g.evSeq++
+		e.Seq = g.evSeq
 		g.emit(e)
 	}
 }
@@ -161,17 +172,19 @@ func (g *Registry) heard(r *Robot, now time.Time, evs []Event) []Event {
 // or a duplicate and was ignored.
 func (g *Registry) ApplyPose(name string, m PoseMsg) bool {
 	g.mu.Lock()
-	r := g.get(name)
+	defer g.mu.Unlock()
+	now := g.now()
+	r, evs := g.get(name, now, nil)
 	if !fresh(r.poseBoot, r.poseSeq, m.Boot, m.Seq) {
-		g.mu.Unlock()
 		return false
 	}
 	r.poseBoot, r.poseSeq = m.Boot, m.Seq
+	if m.Host != "" {
+		r.Host = m.Host
+	}
 	r.Frame, r.Floor = m.Frame, m.Floor
 	r.X, r.Y, r.Yaw, r.V = m.X, m.Y, m.Yaw, m.V
-	evs := g.heard(r, g.now(), nil)
-	g.mu.Unlock()
-	g.flush(evs)
+	g.flush(g.heard(r, now, evs))
 	return true
 }
 
@@ -179,15 +192,14 @@ func (g *Registry) ApplyPose(name string, m PoseMsg) bool {
 // stale or a duplicate and was ignored.
 func (g *Registry) ApplyState(name string, m StateMsg) bool {
 	g.mu.Lock()
-	r := g.get(name)
+	defer g.mu.Unlock()
+	now := g.now()
+	r, evs := g.get(name, now, nil)
 	if !fresh(r.stateBoot, r.stateSeq, m.Boot, m.Seq) {
-		g.mu.Unlock()
 		return false
 	}
-	now := g.now()
 	r.stateBoot, r.stateSeq = m.Boot, m.Seq
-	var evs []Event
-	if m.Mode != r.Mode {
+	if r.Mode != "" && m.Mode != r.Mode { // the first state is covered by "seen"
 		evs = append(evs, Event{Time: now, Robot: name, Type: "mode", From: r.Mode, To: m.Mode})
 	}
 	if m.Error != r.Error {
@@ -209,7 +221,6 @@ func (g *Registry) ApplyState(name string, m StateMsg) bool {
 	} else {
 		evs = g.heard(r, now, evs)
 	}
-	g.mu.Unlock()
 	g.flush(evs)
 	return true
 }
@@ -227,8 +238,8 @@ func (g *Registry) AdapterOffline(host string) {
 			evs = setConn(r, Offline, "adapter offline", now, evs)
 		}
 	}
-	g.mu.Unlock()
 	g.flush(evs)
+	g.mu.Unlock()
 }
 
 // Tick re-evaluates liveness from message age. Call it periodically.
@@ -259,8 +270,8 @@ func (g *Registry) Tick() {
 			evs = setConn(r, Stale, "no message for "+age.Round(100*time.Millisecond).String(), now, evs)
 		}
 	}
-	g.mu.Unlock()
 	g.flush(evs)
+	g.mu.Unlock()
 }
 
 // Get returns a copy of one robot.

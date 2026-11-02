@@ -33,16 +33,22 @@ func TestSlowSubscriberDoesNotBlockOthers(t *testing.T) {
 	}
 }
 
-func TestRecentKeepsLatest(t *testing.T) {
+func TestRecentKeepsLatestInOrder(t *testing.T) {
 	h := NewHub()
-	for i := 0; i < historySize+5; i++ {
-		h.Publish(fleet.Event{Detail: string(rune('a' + i%26))})
+	total := historySize + 5
+	for i := 1; i <= total; i++ {
+		h.Publish(fleet.Event{Seq: uint64(i)})
 	}
-	if got := len(h.Recent(0)); got != historySize {
-		t.Errorf("history = %d, want %d", got, historySize)
+	all := h.Recent(0)
+	if len(all) != historySize {
+		t.Fatalf("history = %d, want %d", len(all), historySize)
 	}
-	if got := h.Recent(3); len(got) != 3 {
-		t.Errorf("Recent(3) returned %d", len(got))
+	if first, last := all[0].Seq, all[len(all)-1].Seq; first != 6 || last != uint64(total) {
+		t.Errorf("history spans seq %d..%d, want 6..%d (oldest dropped first)", first, last, total)
+	}
+	got := h.Recent(3)
+	if len(got) != 3 || got[0].Seq != uint64(total-2) || got[2].Seq != uint64(total) {
+		t.Errorf("Recent(3) = %+v, want the last three oldest first", got)
 	}
 }
 
