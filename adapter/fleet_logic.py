@@ -121,6 +121,15 @@ class GoalTracker:
         self.cmd_id, self.target, self.started, self.sent_at = cmd_id, (x, y), False, now
         return preempted
 
+    def cancel(self, reason):
+        """End the tracked goal because a cancel or dock was accepted. Without
+        this, a cancel that lands before the robot's next 2 Hz state (so the
+        goal was never seen as started) would end as "did not take the goal".
+        Returns (cmd_id, "cancelled", reason), or None if nothing is tracked."""
+        if self.cmd_id is None:
+            return None
+        return self._finish("cancelled", reason)
+
     def _finish(self, status, message):
         out = (self.cmd_id, status, message)
         self.cmd_id, self.target, self.started = None, None, False

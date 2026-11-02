@@ -14,10 +14,20 @@ import (
 
 	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
+	"fleetlab/internal/task"
 )
 
-func New(g *fleet.Registry, hub *events.Hub, log *slog.Logger) http.Handler {
+// Tasks is the task manager as the API sees it (task.Manager).
+type Tasks interface {
+	Submit(wps []task.Waypoint) (task.Task, error)
+	List(state string) []task.Task
+	Get(id string) (task.Task, bool)
+	Cancel(id string) (task.Task, error)
+}
+
+func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
+	routeTasks(mux, tasks)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	})

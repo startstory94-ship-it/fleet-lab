@@ -16,13 +16,15 @@ import (
 
 	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
+	"fleetlab/internal/task"
 )
 
 func newServer(t *testing.T) (*httptest.Server, *fleet.Registry, *events.Hub) {
 	t.Helper()
 	hub := events.NewHub()
 	g := fleet.NewRegistry(fleet.DefaultConfig(), hub.Publish)
-	srv := httptest.NewServer(New(g, hub, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	tasks := task.NewManager(task.DefaultConfig(), task.Deps{Robots: g, Sender: nopSender{}})
+	srv := httptest.NewServer(New(g, hub, tasks, slog.New(slog.NewTextHandler(io.Discard, nil))))
 	t.Cleanup(srv.Close)
 	return srv, g, hub
 }

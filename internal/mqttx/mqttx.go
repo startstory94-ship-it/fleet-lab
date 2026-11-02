@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho"
@@ -27,7 +28,11 @@ type Subscription struct {
 
 type Client struct {
 	cm *autopaho.ConnectionManager
+	up chan struct{}
 }
+
+// Up is closed when the first connection is established.
+func (c *Client) Up() <-chan struct{} { return c.up }
 
 // Backoff returns the wait before reconnect attempt n: exponential from 1 s,
 // capped at 30 s, with ±50% jitter so many clients don't retry in lockstep.
@@ -45,6 +50,8 @@ func Connect(ctx context.Context, log *slog.Logger, brokerURL, clientID string,
 	if err != nil {
 		return nil, fmt.Errorf("mqtt url: %w", err)
 	}
+	up := make(chan struct{})
+	var upOnce sync.Once
 	opts := make([]paho.SubscribeOptions, len(subs))
 	for i, s := range subs {
 		opts[i] = paho.SubscribeOptions{Topic: s.Topic, QoS: s.QoS}
@@ -58,6 +65,7 @@ func Connect(ctx context.Context, log *slog.Logger, brokerURL, clientID string,
 		ConnectTimeout:                5 * time.Second,
 		OnConnectionUp: func(cm *autopaho.ConnectionManager, _ *paho.Connack) {
 			log.Info("mqtt connected", "broker", u.Host)
+			upOnce.Do(func() { close(up) })
 			go func() {
 				if _, err := cm.Subscribe(ctx, &paho.Subscribe{Subscriptions: opts}); err != nil {
 					log.Error("mqtt subscribe", "err", err)
@@ -83,7 +91,7 @@ func Connect(ctx context.Context, log *slog.Logger, brokerURL, clientID string,
 	if err != nil {
 		return nil, err
 	}
-	return &Client{cm: cm}, nil
+	return &Client{cm: cm, up: up}, nil
 }
 
 // Publish sends one message. It fails if not currently connected.

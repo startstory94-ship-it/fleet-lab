@@ -3,19 +3,26 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"time"
 
 	"fleetlab/internal/api"
 	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
 	"fleetlab/internal/mqttx"
+	"fleetlab/internal/store"
+	"fleetlab/internal/task"
 )
+
+const topicCmdAck = "fleet/+/cmd_ack"
 
 type config struct {
 	httpAddr string
@@ -46,11 +53,57 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	db, err := store.Open(cfg.dbPath, log)
+	if err != nil {
+		log.Error("open db", "path", cfg.dbPath, "err", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
 	hub := events.NewHub()
-	registry := fleet.NewRegistry(fleet.DefaultConfig(), func(e fleet.Event) {
-		log.Info("event", "robot", e.Robot, "type", e.Type, "from", e.From, "to", e.To, "detail", e.Detail)
+	// Robot and task events share one numbering. Each source calls publish
+	// with its own lock held, so numbers follow the order of the changes.
+	var seqMu sync.Mutex
+	var seq uint64
+	publish := func(e fleet.Event) {
+		seqMu.Lock()
+		seq++
+		e.Seq = seq
 		hub.Publish(e)
+		seqMu.Unlock()
+	}
+
+	fleetCfg := fleet.DefaultConfig()
+	registry := fleet.NewRegistry(fleetCfg, func(e fleet.Event) {
+		log.Info("event", "robot", e.Robot, "type", e.Type, "from", e.From, "to", e.To, "detail", e.Detail)
+		publish(e)
 	})
+
+	cmds := newCmdQueue(log)
+	taskCfg := task.DefaultConfig()
+	// After a restart a robot that is merely slow must not lose its task.
+	taskCfg.RestoreGrace = max(taskCfg.RestoreGrace, fleetCfg.OfflineAfter+5*time.Second)
+	tasks := task.NewManager(taskCfg, task.Deps{
+		Robots: registry, Sender: cmds, Store: db, Log: log,
+		Emit: func(e task.Event) {
+			detail := e.Kind
+			if e.Detail != "" {
+				detail += ": " + e.Detail
+			}
+			publish(fleet.Event{Time: e.Time, Robot: e.Robot, Type: "task", Task: e.Task,
+				From: e.From, To: e.To, Detail: detail})
+		},
+	})
+	if err := tasks.Restore(); err != nil {
+		log.Error("restore tasks", "err", err)
+		os.Exit(1)
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		tasks.RunWriter(ctx)
+		close(writerDone)
+	}()
+
 	go func() {
 		t := time.NewTicker(250 * time.Millisecond)
 		defer t.Stop()
@@ -60,21 +113,43 @@ func main() {
 				return
 			case <-t.C:
 				registry.Tick()
+				tasks.Tick()
 			}
 		}
 	}()
 
+	ingest := fleet.Ingest(registry, log)
 	mq, err := mqttx.Connect(ctx, log, cfg.mqttURL, "fleetd", []mqttx.Subscription{
 		{Topic: fleet.TopicPose, QoS: 0},
 		{Topic: fleet.TopicState, QoS: 1},
 		{Topic: fleet.TopicAdapterStatus, QoS: 1},
-	}, fleet.Ingest(registry, log))
+		{Topic: topicCmdAck, QoS: 1},
+	}, func(topic string, payload []byte) {
+		if robot, ok := ackTopic(topic); ok {
+			var a task.Ack
+			if err := json.Unmarshal(payload, &a); err != nil || a.CmdID == "" {
+				log.Warn("bad cmd_ack", "topic", topic, "err", err)
+				return
+			}
+			tasks.HandleAck(robot, a)
+			return
+		}
+		ingest(topic, payload)
+	})
 	if err != nil {
 		log.Error("mqtt", "err", err)
 		os.Exit(1)
 	}
+	go cmds.run(ctx, mq)
+	go func() {
+		select {
+		case <-mq.Up():
+			tasks.LinkUp() // restored tasks get their grace from now
+		case <-ctx.Done():
+		}
+	}()
 
-	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, log), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, tasks, log), ReadHeaderTimeout: 5 * time.Second}
 
 	go func() {
 		log.Info("http listening", "addr", cfg.httpAddr)
@@ -92,4 +167,59 @@ func main() {
 		log.Error("http shutdown", "err", err)
 	}
 	mq.Close(shutdownCtx)
+	<-writerDone // last flush of task changes
+}
+
+// ackTopic returns the robot of a fleet/<robot>/cmd_ack topic.
+func ackTopic(topic string) (string, bool) {
+	parts := strings.Split(topic, "/")
+	if len(parts) == 3 && parts[0] == "fleet" && parts[2] == "cmd_ack" && parts[1] != "" {
+		return parts[1], true
+	}
+	return "", false
+}
+
+// cmdQueue is the task manager's Sender. The manager calls Send with its lock
+// held, and a QoS 1 publish waits for the broker, so commands are handed to
+// a goroutine instead. A command lost here is re-sent by the manager.
+type cmdQueue struct {
+	ch  chan outCmd
+	log *slog.Logger
+}
+
+type outCmd struct {
+	robot string
+	cmd   task.Command
+}
+
+func newCmdQueue(log *slog.Logger) *cmdQueue {
+	return &cmdQueue{ch: make(chan outCmd, 256), log: log}
+}
+
+func (q *cmdQueue) Send(robot string, c task.Command) error {
+	select {
+	case q.ch <- outCmd{robot, c}:
+		return nil
+	default:
+		return errors.New("command queue full")
+	}
+}
+
+func (q *cmdQueue) run(ctx context.Context, mq *mqttx.Client) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case o := <-q.ch:
+			body, _ := json.Marshal(o.cmd)
+			pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := mq.Publish(pctx, "fleet/"+o.robot+"/cmd", 1, false, body)
+			cancel()
+			if err != nil {
+				q.log.Warn("publish cmd", "robot", o.robot, "cmd_id", o.cmd.CmdID, "err", err)
+			} else {
+				q.log.Debug("cmd sent", "robot", o.robot, "cmd_id", o.cmd.CmdID, "type", o.cmd.Type)
+			}
+		}
+	}
 }

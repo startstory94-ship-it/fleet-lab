@@ -258,9 +258,17 @@ class FleetAdapter(Node):
                 self.ack(r, cmd_id, "failed", f"{kind} service not available")
                 return
             future = client.call_async(Trigger.Request())
-            future.add_done_callback(lambda f: self.ack(r, cmd_id, *service_outcome(f)))
+            future.add_done_callback(lambda f: self.on_service_done(r, cmd_id, kind, f))
         else:
             self.ack(r, cmd_id, "failed", f"unknown command type {kind!r}")
+
+    def on_service_done(self, r, cmd_id, kind, future):
+        status, message = service_outcome(future)
+        if status == "accepted" and kind in ("cancel", "dock"):
+            ended = r.goal.cancel(f"{kind} requested by {cmd_id}")
+            if ended:
+                self.ack(r, *ended)
+        self.ack(r, cmd_id, status, message)
 
     def close(self):
         # A clean shutdown says offline itself; the LWT only covers crashes.
