@@ -50,14 +50,16 @@ const (
 type Event struct {
 	// Seq increases by one per event, in the order the changes happened.
 	// Listeners can use it to spot gaps (dropped events) or reordering.
-	Seq    uint64    `json:"seq"`
-	Time   time.Time `json:"time"`
-	Robot  string    `json:"robot"`
-	Type   string    `json:"type"` // seen, conn, mode, error, elevator_overdue, adapter, task, battery
-	Task   string    `json:"task,omitempty"`
-	From   string    `json:"from,omitempty"`
-	To     string    `json:"to,omitempty"`
-	Detail string    `json:"detail,omitempty"`
+	Seq   uint64    `json:"seq"`
+	Time  time.Time `json:"time"`
+	Robot string    `json:"robot"`
+	Type  string    `json:"type"` // seen, conn, mode, error, elevator_overdue, adapter, task, battery, elevator
+	Task  string    `json:"task,omitempty"`
+	// Elevator is the car of an elevator event (type "elevator").
+	Elevator string `json:"elevator,omitempty"`
+	From     string `json:"from,omitempty"`
+	To       string `json:"to,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 // Config holds the liveness thresholds.

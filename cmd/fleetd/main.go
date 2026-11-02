@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"fleetlab/internal/api"
+	"fleetlab/internal/elevator"
 	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
 	"fleetlab/internal/live"
@@ -31,6 +32,7 @@ type config struct {
 	dbPath   string
 	logLevel string
 	frame    time.Duration
+	lifts    string
 }
 
 func parseFlags() config {
@@ -40,6 +42,7 @@ func parseFlags() config {
 	flag.StringVar(&c.dbPath, "db", "fleetd.db", "SQLite database path")
 	flag.StringVar(&c.logLevel, "log", "info", "log level: debug, info, warn, error")
 	flag.DurationVar(&c.frame, "frame", live.DefaultConfig().FrameInterval, "dashboard frame interval (/ws/live)")
+	flag.StringVar(&c.lifts, "elevators", "", `elevator config JSON file; "" = one default car E1 (floors 1-10, lobby (10,0)), "none" = no elevators`)
 	flag.Parse()
 	return c
 }
@@ -82,18 +85,27 @@ func main() {
 		publish(e)
 	})
 
-	cmds := newCmdQueue(log)
+	lifts, err := elevator.Load(cfg.lifts)
+	if err != nil {
+		log.Error("elevator config", "path", cfg.lifts, "err", err)
+		os.Exit(1)
+	}
+	for _, c := range lifts.Elevators {
+		log.Info("elevator", "id", c.ID, "floors", c.Floors, "capacity", c.Capacity, "lobby", c.Lobby)
+	}
+
+	cmds := newOutbox(log)
 	taskCfg := task.DefaultConfig()
 	// After a restart a robot that is merely slow must not lose its task.
 	taskCfg.RestoreGrace = max(taskCfg.RestoreGrace, fleetCfg.OfflineAfter+5*time.Second)
 	tasks := task.NewManager(taskCfg, task.Deps{
-		Robots: registry, Sender: cmds, Store: db, Log: log,
+		Robots: registry, Sender: cmds, Store: db, Log: log, Elevators: lifts, Lift: cmds,
 		Emit: func(e task.Event) {
 			detail := e.Kind
 			if e.Detail != "" {
 				detail += ": " + e.Detail
 			}
-			publish(fleet.Event{Time: e.Time, Robot: e.Robot, Type: e.Type, Task: e.Task,
+			publish(fleet.Event{Time: e.Time, Robot: e.Robot, Type: e.Type, Task: e.Task, Elevator: e.Elevator,
 				From: e.From, To: e.To, Detail: detail})
 		},
 	})
@@ -127,7 +139,24 @@ func main() {
 		{Topic: fleet.TopicState, QoS: 1},
 		{Topic: fleet.TopicAdapterStatus, QoS: 1},
 		{Topic: topicCmdAck, QoS: 1},
+		{Topic: elevator.SubState, QoS: 1},
+		{Topic: elevator.SubZone, QoS: 1},
+		{Topic: elevator.SubTrip, QoS: 1},
+		{Topic: elevator.SubRobotEvent, QoS: 1},
 	}, func(topic string, payload []byte) {
+		if car, kind, ok := elevator.SplitTopic(topic); ok {
+			handleElevator(log, tasks, car, kind, payload)
+			return
+		}
+		if robot, ok := robotTopic(topic, "event"); ok {
+			var e elevator.RobotEvent
+			if err := json.Unmarshal(payload, &e); err != nil || e.Event == "" {
+				log.Warn("bad robot event", "topic", topic, "err", err)
+				return
+			}
+			tasks.HandleRobotEvent(robot, e)
+			return
+		}
 		if robot, ok := ackTopic(topic); ok {
 			var a task.Ack
 			if err := json.Unmarshal(payload, &a); err != nil || a.CmdID == "" {
@@ -149,6 +178,17 @@ func main() {
 		case <-mq.Up():
 			tasks.LinkUp() // restored tasks get their grace from now
 		case <-ctx.Done():
+			return
+		}
+		// A retained trip published while the broker was away may be lost:
+		// publish every current trip again on each (re)connect.
+		for {
+			select {
+			case <-mq.Connected():
+				tasks.RepublishTrips()
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -183,55 +223,41 @@ func main() {
 }
 
 // ackTopic returns the robot of a fleet/<robot>/cmd_ack topic.
-func ackTopic(topic string) (string, bool) {
+func ackTopic(topic string) (string, bool) { return robotTopic(topic, "cmd_ack") }
+
+// robotTopic returns the robot of a fleet/<robot>/<kind> topic.
+func robotTopic(topic, kind string) (string, bool) {
 	parts := strings.Split(topic, "/")
-	if len(parts) == 3 && parts[0] == "fleet" && parts[2] == "cmd_ack" && parts[1] != "" {
+	if len(parts) == 3 && parts[0] == "fleet" && parts[2] == kind && parts[1] != "" && parts[1] != "adapter" {
 		return parts[1], true
 	}
 	return "", false
 }
 
-// cmdQueue is the task manager's Sender. The manager calls Send with its lock
-// held, and a QoS 1 publish waits for the broker, so commands are handed to
-// a goroutine instead. A command lost here is re-sent by the manager.
-type cmdQueue struct {
-	ch  chan outCmd
-	log *slog.Logger
-}
-
-type outCmd struct {
-	robot string
-	cmd   task.Command
-}
-
-func newCmdQueue(log *slog.Logger) *cmdQueue {
-	return &cmdQueue{ch: make(chan outCmd, 256), log: log}
-}
-
-func (q *cmdQueue) Send(robot string, c task.Command) error {
-	select {
-	case q.ch <- outCmd{robot, c}:
-		return nil
-	default:
-		return errors.New("command queue full")
-	}
-}
-
-func (q *cmdQueue) run(ctx context.Context, mq *mqttx.Client) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case o := <-q.ch:
-			body, _ := json.Marshal(o.cmd)
-			pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			err := mq.Publish(pctx, "fleet/"+o.robot+"/cmd", 1, false, body)
-			cancel()
-			if err != nil {
-				q.log.Warn("publish cmd", "robot", o.robot, "cmd_id", o.cmd.CmdID, "err", err)
-			} else {
-				q.log.Debug("cmd sent", "robot", o.robot, "cmd_id", o.cmd.CmdID, "type", o.cmd.Type)
-			}
+// handleElevator feeds elevator/<id>/state, zone and trip to the manager.
+func handleElevator(log *slog.Logger, tasks *task.Manager, car, kind string, payload []byte) {
+	var err error
+	switch kind {
+	case "state":
+		var s elevator.State
+		if err = json.Unmarshal(payload, &s); err == nil {
+			tasks.HandleElevatorState(car, s)
 		}
+	case "zone":
+		var z elevator.Zone
+		if err = json.Unmarshal(payload, &z); err == nil {
+			tasks.HandleZone(car, z)
+		}
+	case "trip":
+		if len(payload) == 0 {
+			return // retained message cleared
+		}
+		var t elevator.Trip
+		if err = json.Unmarshal(payload, &t); err == nil {
+			tasks.RestoreTrip(car, t) // ignored unless an earlier run published it
+		}
+	}
+	if err != nil {
+		log.Warn("bad elevator message", "elevator", car, "kind", kind, "err", err)
 	}
 }

@@ -151,6 +151,12 @@ func (m *Manager) checkBattery(robots []fleet.Robot, now time.Time) {
 			continue
 		}
 		if t := held[r.Name]; t != nil {
+			if t.Phase == PhaseWait || t.Phase == PhaseRide {
+				if !t.restoring && r.Conn == fleet.Online && r.Battery < m.cfg.CriticalBattery {
+					m.criticalAtElevator(t, r, now)
+				}
+				continue
+			}
 			// A restored task the robot reports was confirmed by follow this tick;
 			// one it does not report is left to the restore probe.
 			if !t.handBack && r.Conn == fleet.Online && r.TaskID == t.CmdID &&

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"fleetlab/internal/elevator"
 	"fleetlab/internal/fleet"
 )
 
@@ -41,6 +42,10 @@ type Config struct {
 	DockTimeout     time.Duration // re-send a dock if the robot is not DOCKING after this
 	MaxDockTries    int           // docks before backing off
 	DockCooldown    time.Duration // the back-off
+
+	// EventReorder: a robot event that does not follow the last recorded seq
+	// waits this long for the missing ones before it is recorded anyway.
+	EventReorder time.Duration
 }
 
 func DefaultConfig() Config {
@@ -63,6 +68,8 @@ func DefaultConfig() Config {
 		DockTimeout:     10 * time.Second,
 		MaxDockTries:    3,
 		DockCooldown:    time.Minute,
+
+		EventReorder: time.Second,
 	}
 }
 
@@ -77,6 +84,11 @@ type Deps struct {
 	// Boot goes into every cmd_id so ids from different server runs never
 	// collide. Random when empty.
 	Boot string
+	// Elevators are the cars legs on other floors ride (ride.go). With none,
+	// every leg is a plain goto. Lift publishes on their channel; it is
+	// required when there are cars.
+	Elevators elevator.Config
+	Lift      elevator.Link
 }
 
 // watch is a goto the server took away from a robot (robot lost, no
@@ -112,6 +124,9 @@ type Manager struct {
 	noBattery map[string]bool      // robots whose state has no battery (logged once)
 	docks     int                  // dock commands sent, for their cmd_ids
 	linkUp    bool
+	cars      map[string]*elevator.Car
+	carIDs    []string
+	events    map[string]*eventBuf // robot -> events waiting to be recorded in seq order
 
 	// Persistence: the latest copy of each changed task, written by Flush.
 	dirty   map[string]Task
@@ -132,9 +147,12 @@ func NewManager(cfg Config, d Deps) *Manager {
 	if d.Boot == "" {
 		d.Boot = strings.ToLower(rand.Text()[:6])
 	}
-	return &Manager{cfg: cfg, d: d, tasks: make(map[string]*Task),
+	m := &Manager{cfg: cfg, d: d, tasks: make(map[string]*Task),
 		sightings: make(map[string]sighting), cooldown: make(map[string]time.Time),
-		charge: make(map[string]*charge), noBattery: make(map[string]bool), dirty: make(map[string]Task), wake: make(chan struct{}, 1)}
+		charge: make(map[string]*charge), noBattery: make(map[string]bool), dirty: make(map[string]Task), wake: make(chan struct{}, 1),
+		cars: make(map[string]*elevator.Car), events: make(map[string]*eventBuf)}
+	m.initCars()
+	return m
 }
 
 // Restore loads tasks from the store. Call it once, before anything else.
@@ -265,7 +283,12 @@ func (m *Manager) Cancel(id string) (Task, error) {
 	}
 	now := m.d.Now()
 	if t.active() {
-		m.sendCancel(m.addWatch(t, now), now)
+		if t.CmdID != "" {
+			m.sendCancel(m.addWatch(t, now), now)
+		}
+		// A robot already moving through the door or in the car stays in the
+		// trip: the car takes it to its stop.
+		m.leaveElevator(t, now, "task cancelled")
 	}
 	t.Finished, t.restoring, t.handBack = now, false, false
 	m.set(t, now, t.Robot, "cancelled", Cancelled, "cancelled by user")
@@ -289,9 +312,25 @@ func (m *Manager) HandleAck(robot string, a Ack) {
 	now := m.d.Now()
 	switch a.Status {
 	case "accepted":
+		if t.Phase == PhaseRide {
+			m.rideAccepted(t, now)
+			return
+		}
 		m.confirm(t, now)
 	case "done":
-		m.legDone(t, now)
+		switch t.Phase {
+		case PhaseLobby:
+			m.confirm(t, now)
+			if t.handBack {
+				m.requeue(t, now, t.Error) // battery critical on the way: do not queue
+				return
+			}
+			m.enterWait(t, now)
+		case PhaseRide:
+			m.rideDone(t, a, now)
+		default:
+			m.legDone(t, now)
+		}
 	case "failed", "cancelled":
 		if t.handBack {
 			m.requeue(t, now, t.Error) // stopped as asked: not the robot's failure
@@ -327,6 +366,7 @@ func (m *Manager) Tick() {
 	m.spotStrays(robots, now)
 	m.chaseWatches(byName, now)
 	m.checkBattery(robots, now)
+	m.tickCars(byName, now)
 	m.assign(robots, now)
 }
 
@@ -338,6 +378,10 @@ func (m *Manager) follow(t *Task, r *fleet.Robot, now time.Time) {
 	}
 	if t.handBack {
 		m.followHandBack(t, r, now)
+		return
+	}
+	if t.Phase == PhaseWait || t.Phase == PhaseRide {
+		m.followRide(t, r, now)
 		return
 	}
 	paused := now.Sub(t.lastFollow)
@@ -361,9 +405,9 @@ func (m *Manager) follow(t *Task, r *fleet.Robot, now time.Time) {
 		m.fail(t, now, "robot "+r.Name+" in ERROR: "+r.Error, true)
 		return
 	}
-	w := t.Waypoints[t.Leg]
 	if t.legDeadline.IsZero() && r.HasPose {
-		d := math.Hypot(r.X-w.X, r.Y-w.Y) / m.cfg.LegMinSpeed
+		x, y := m.target(t)
+		d := math.Hypot(r.X-x, r.Y-y) / m.cfg.LegMinSpeed
 		t.legDeadline = now.Add(m.cfg.LegSlack + time.Duration(d*float64(time.Second)))
 	}
 	if !t.legDeadline.IsZero() && now.After(t.legDeadline) {
@@ -394,6 +438,14 @@ func (m *Manager) follow(t *Task, r *fleet.Robot, now time.Time) {
 
 // followRestored handles a task that was on a robot when the server stopped.
 func (m *Manager) followRestored(t *Task, r *fleet.Robot, now time.Time) {
+	switch t.Phase {
+	case PhaseWait:
+		m.restoreWait(t, r, now)
+		return
+	case PhaseRide:
+		m.restoreRide(t, r, now)
+		return
+	}
 	if r != nil && r.Mode == "" {
 		r = nil // only poses so far; its task_id is not known yet
 	}
@@ -451,7 +503,11 @@ func (m *Manager) legDone(t *Task, now time.Time) {
 		m.requeue(t, now, t.Error) // the next leg goes to another robot
 		return
 	}
-	m.newCmd(t, now)
+	// The robot is at the waypoint it just reached, so on its floor.
+	if err := m.prepareLeg(t, t.Waypoints[t.Leg-1].Floor, now); err != nil {
+		m.failForGood(t, now, err.Error())
+		return
+	}
 	m.set(t, now, t.Robot, "leg_done", Assigned, fmt.Sprintf("leg %d/%d, next %s", t.Leg, len(t.Waypoints), t.CmdID))
 	m.sendGoto(t, now)
 }
@@ -467,6 +523,7 @@ func (m *Manager) fail(t *Task, now time.Time, reason string, watch bool) {
 	}
 	t.Attempts++
 	if t.Attempts > m.cfg.MaxAttempts {
+		m.leaveElevator(t, now, reason)
 		t.Error, t.Finished, t.restoring = reason, now, false
 		m.set(t, now, t.Robot, "failed", Failed, reason)
 		return
@@ -475,6 +532,7 @@ func (m *Manager) fail(t *Task, now time.Time, reason string, watch bool) {
 }
 
 func (m *Manager) requeue(t *Task, now time.Time, reason string) {
+	m.leaveElevator(t, now, reason)
 	robot := t.Robot
 	t.Robot, t.CmdID, t.Error, t.restoring, t.handBack = "", "", reason, false, false
 	m.set(t, now, robot, "requeued", Queued, reason)
@@ -502,9 +560,13 @@ func (m *Manager) assign(robots []fleet.Robot, now time.Time) {
 		}
 		i := m.pick(free, t)
 		t.Robot = free[i].Name
+		floor := free[i].Floor
 		free = append(free[:i], free[i+1:]...)
 		t.Dispatches++
-		m.newCmd(t, now)
+		if err := m.prepareLeg(t, floor, now); err != nil {
+			m.failForGood(t, now, err.Error())
+			continue
+		}
 		m.set(t, now, t.Robot, "assigned", Assigned, t.CmdID)
 		m.sendGoto(t, now)
 	}
@@ -629,14 +691,26 @@ func (m *Manager) spotStrays(robots []fleet.Robot, now time.Time) {
 
 func (m *Manager) newCmd(t *Task, now time.Time) {
 	t.CmdID = fmt.Sprintf("%s.%d.%d.%s", t.ID, t.Leg, t.Dispatches, m.d.Boot)
+	switch t.Phase {
+	case PhaseLobby:
+		t.CmdID += fmt.Sprintf(".L%d", t.Hops)
+	case PhaseRide:
+		t.CmdID = m.rideID(t)
+	}
 	t.waitFrom, t.resends, t.probed = now, 0, false
-	t.legDeadline, t.lastFollow = time.Time{}, time.Time{}
+	t.legDeadline, t.lastFollow, t.strayRide = time.Time{}, time.Time{}, time.Time{}
 }
 
+// sendGoto sends (or re-sends) the current command: a goto to the waypoint
+// or to the elevator lobby, or the ride.
 func (m *Manager) sendGoto(t *Task, now time.Time) {
-	w := t.Waypoints[t.Leg]
+	if t.Phase == PhaseRide {
+		m.sendRide(t, now)
+		return
+	}
+	x, y := m.target(t)
 	t.lastSent = now
-	m.send(t.Robot, Command{CmdID: t.CmdID, Type: "goto", X: w.X, Y: w.Y, ExpiresAt: m.expires(now)})
+	m.send(t.Robot, Command{CmdID: t.CmdID, Type: "goto", X: x, Y: y, ExpiresAt: m.expires(now)})
 }
 
 // sendCancel stops whatever the robot is driving. Its cmd_id embeds the time
@@ -644,7 +718,7 @@ func (m *Manager) sendGoto(t *Task, now time.Time) {
 func (m *Manager) sendCancel(w *watch, now time.Time) {
 	w.lastCancel, w.lastSend = now, now
 	id := fmt.Sprintf("%s.x%d", w.cmdID, now.UnixMilli())
-	m.send(w.robot, Command{CmdID: id, Type: "cancel", ExpiresAt: m.expires(now)})
+	m.send(w.robot, Command{CmdID: id, Type: "cancel", Target: w.cmdID, ExpiresAt: m.expires(now)})
 }
 
 func (m *Manager) send(robot string, c Command) {

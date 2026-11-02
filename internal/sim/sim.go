@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"fleetlab/internal/elevator"
 	"fleetlab/internal/fleet"
 	"fleetlab/internal/task"
 )
@@ -50,6 +51,26 @@ type Robot struct {
 	reports  int
 	stateSeq uint64
 	poseSeq  uint64
+
+	// Elevator ride (elevator.go).
+	ride         *elevator.RidePlan
+	rideCmd      string
+	rideState    string // waiting, boarding, inside, exiting, out
+	results      map[int]elevator.Zone
+	moveN        int
+	moveAct      string
+	moveFloor    int
+	moveLeft     float64 // seconds left through the door zone
+	linkAt       time.Time
+	failExits    int
+	wrongFloor   *int
+	extraSilence time.Duration
+	events       []elevator.RobotEvent // queued until the link is up
+	evSeq        uint64
+	zoneSeq      uint64
+	exitLobby    elevator.Point
+	dropTurns    int
+	dropZones    int
 }
 
 type inCmd struct {
@@ -80,13 +101,29 @@ type Fleet struct {
 	onAck    func(robot string, a task.Ack)
 	drain    float64 // % per metre driven
 	charge   float64 // % per second on the dock
+
+	cars      map[string]*Car
+	carNames  []string
+	trips     map[string]elevator.Trip
+	cleared   map[string]int
+	elevIn    []elevMsg // to cars and robots
+	elevOut   []elevMsg // to the server
+	elevDelay time.Duration
+	doorMove  time.Duration
+	linkBack  time.Duration
+	onState   func(car string, s elevator.State)
+	onZone    func(car string, z elevator.Zone)
+	onEvent   func(robot string, e elevator.RobotEvent)
 }
 
 // New creates an empty fleet. Robots move at speed m/s.
 func New(reg *fleet.Registry, now func() time.Time, speed float64, seed uint64) *Fleet {
 	return &Fleet{reg: reg, now: now, speed: speed, robots: make(map[string]*Robot),
 		rng: rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15)), onAck: func(string, task.Ack) {},
-		charge: 1}
+		charge: 1, cars: map[string]*Car{}, trips: map[string]elevator.Trip{}, cleared: map[string]int{},
+		elevDelay: 50 * time.Millisecond, doorMove: 2 * time.Second, linkBack: time.Second,
+		onState: func(string, elevator.State) {}, onZone: func(string, elevator.Zone) {},
+		onEvent: func(string, elevator.RobotEvent) {}}
 }
 
 // OnAck sets where acks go (task.Manager.HandleAck).
@@ -259,9 +296,37 @@ func (f *Fleet) Step(dt time.Duration) {
 		}
 		r.outbox = keep
 	}
+	elev := f.stepElevators(dt, now)
+	type evDelivery struct {
+		robot string
+		ev    elevator.RobotEvent
+	}
+	var evs []evDelivery
+	for _, name := range f.names {
+		r := f.robots[name]
+		if r.silent || len(r.events) == 0 {
+			continue
+		}
+		// Newest first: after a blackout the server must put them in order.
+		for i := len(r.events) - 1; i >= 0; i-- {
+			evs = append(evs, evDelivery{name, r.events[i]})
+		}
+		r.events = r.events[:0]
+	}
 	f.mu.Unlock()
 
 	// Outside the lock: the manager may send commands back synchronously.
+	for _, m := range elev {
+		switch {
+		case m.st != nil:
+			f.onState(m.car, *m.st)
+		case m.zone != nil:
+			f.onZone(m.car, *m.zone)
+		}
+	}
+	for _, e := range evs {
+		f.onEvent(e.robot, e.ev)
+	}
 	for _, d := range out {
 		f.onAck(d.robot, d.ack)
 	}
@@ -282,6 +347,10 @@ func (f *Fleet) handle(r *Robot, c task.Command, now time.Time) {
 	}
 	switch c.Type {
 	case "goto":
+		if r.ride != nil {
+			f.ack(r, c.CmdID, "failed", "holds ride "+r.rideCmd)
+			return
+		}
 		if r.Goal != "" {
 			f.finish(r, "cancelled", "preempted by "+c.CmdID)
 		}
@@ -292,7 +361,13 @@ func (f *Fleet) handle(r *Robot, c task.Command, now time.Time) {
 		}
 		r.Goal, r.gx, r.gy, r.Mode = c.CmdID, c.X, c.Y, "MOVING"
 		r.Started = append(r.Started, c.CmdID)
+	case "ride":
+		f.rideCmd(r, c, now)
 	case "cancel":
+		if r.ride != nil {
+			f.cancelRide(r, c)
+			return
+		}
 		if r.Goal == "" && r.Mode != "DOCKING" {
 			r.IdleCancels++
 			f.ack(r, c.CmdID, "failed", "nothing to cancel")
@@ -305,6 +380,10 @@ func (f *Fleet) handle(r *Robot, c task.Command, now time.Time) {
 		f.ack(r, c.CmdID, "accepted", "")
 	case "dock":
 		// The adapter ends a tracked goto as cancelled once the dock is accepted.
+		if r.ride != nil {
+			f.ack(r, c.CmdID, "failed", "holds ride "+r.rideCmd)
+			return
+		}
 		if r.Mode == "ERROR" {
 			f.ack(r, c.CmdID, "failed", "in ERROR ("+r.Error+")")
 			return
@@ -338,6 +417,8 @@ func (f *Fleet) drive(r *Robot, dt float64, now time.Time) {
 			r.Mode = "CHARGING"
 			r.Charges++
 		}
+	case r.ride != nil:
+		return // at the lobby or in the car: elevator.go moves it
 	case r.Goal != "" && r.Mode != "ERROR":
 		if f.move(r, r.gx, r.gy, dt) {
 			r.Mode = "IDLE"

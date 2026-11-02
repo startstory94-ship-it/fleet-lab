@@ -182,19 +182,106 @@
 브라우저 확인(`demo.bat`, 앱 안 브라우저): 클릭 → 3초 알림 → "취소" → `CANCELLED`; 2층 작업을 만들면 층 버튼에 2층이 생기고 누르면 그 층 지점만 보임; 작업 목록 "취소"로 수행 중 작업 취소(로봇 멈춤);
 `drop_comms`를 8초마다 보내 robot_2를 STALE(흐린 점선 원) → OFFLINE(어두운 원에 X) → 복구; fleetd를 끄면 "연결 끊김" 띠와 두 배지 "끊김", 다시 켜면 띠가 사라지고 "서버가 다시 시작됨" 알림 뒤 새 서버의 이벤트가 처음부터 보임.
 확인하지 못한 것: 연결은 살아 있는데 서버가 멈춘 경우의 "응답 없음"(서버를 죽이면 소켓이 바로 닫혀서 재현 못 함, heartbeat 쪽은 Go 테스트로만), IN_ELEVATOR 그리기(6단계 전이라 mock이 보내지 않음).
-## 6단계: 목적층이 다른 로봇 함께 태우기 (계획) ⭐
+
+## 6단계: 목적층이 다른 로봇 함께 태우기 ⭐ (6a: 서버·sim·프로토콜)
+
+6a는 서버 쪽만 한다: 계획 함수, 운행 지휘, 작업 단계 연결, `internal/sim`의 엘리베이터와 탑승 로봇, 규약 문서 [ELEVATOR.md](ELEVATOR.md).
+ROS mock 로봇·어댑터·mock 엘리베이터·대시보드·e2e는 6b(이 문서대로 구현). 아래 테스트는 모두 가짜 시계라 1초 안에 끝난다.
+
+### 계획 함수 (`internal/elevator/plan_test.go`)
 
 | 테스트 | 상태 | 리뷰 |
 |---|---|---|
-| 3·7·5층 → 탑승 7·5·3, 3층 로봇이 문 쪽 | ⬜ | 좋음 |
-| 같은 층 2대, 칸 부족 분할, 방향 다름 분리, 내려갈 때 반대 순서, 0·1대 | ⬜ | 좋음 |
-| 🔧 무작위 입력 1,000개로 규칙 검사 | 🔧 | 예시 몇 개보다 강하다. 규칙: ① 모든 정차 층에서 내릴 로봇이 문 쪽에 있다 ② 칸 수를 넘지 않는다 ③ 방향이 섞이지 않는다 ④ 같은 입력이면 같은 결과 |
-| 🔧 목적층이 현재 층과 같은 로봇 | 🔧 | 태우지 않아야 한다 |
-| 한 대씩 하차, 앞 로봇이 문 구역을 벗어난 뒤 다음 출발 | ⬜ | 가짜 시계로 시간 흐름을 제어해야 빠르고 안정적이다 |
-| 하차 실패, 문 앞 막힘, 엘리베이터 응답 없음 | ⬜ | 좋음 |
-| 탑승 중 끊김이 OFFLINE으로 잡히지 않음 | ✅ 서버 로직만 (2단계) | 6단계에서 실제 로봇 동작과 이어서 다시 확인 |
-| 다시 연결 후 쌓인 이벤트로 시간순 정리, 잘못된 층 하차 감지 | ⬜ | 좋음 |
-| 🔧 엘리베이터 벤더 어댑터 2종이 같은 인터페이스로 같은 결과 | 🔧 | 같은 테스트를 두 구현에 돌리는 방식 |
+| 1층에서 3·7·5층 → 탑승 7·5·3, 3층 로봇이 칸 0(문 쪽), 입력 순서와 상관없음 | ✅ `TestPlanTable` (15줄) | 같은 층 2대(이름순으로 문 쪽), 칸 부족(가까운 층부터, 나머지 `capacity`), 방향 다름(`direction`), 방향을 안 주면 다수·같으면 가까운 쪽, 내려갈 때 반대, 지하층, 0대·1대, 목적층 = 현재 층(`same_floor`, 태우지 않음), 같은 로봇 두 번(`duplicate`), 칸 0 |
+| 칸 수만큼 나눠 여러 번 | ✅ `TestPlanTripsSplitsByCapacity` | 7대·2칸 → 운행 3번(가까운 층부터), 반대 방향은 마지막 운행의 `deferred`에 한 번만 |
+| 🔧 무작위 입력 규칙 검사 | ✅ `TestPlanProperties` (5,000개) | 매 정차 층에서 내릴 로봇이 남는 로봇보다 모두 문 쪽, 늦게 타는 로봇이 더 문 쪽, 칸 수 이하, 방향 하나, 정차층 = 목적층·이동 순서, 모든 로봇이 정확히 한 번 타거나 한 번 미뤄짐, 결정적, 입력 순서를 섞어도 같은 결과, `PlanTrips`로 나누면 같은 방향 로봇이 모두 정확히 한 번 탐 |
+
+### 운행 지휘 (`internal/elevator/car_test.go`, 가짜 시계·가짜 링크)
+
+| 테스트 | 상태 | 리뷰 |
+|---|---|---|
+| 3초 모으기 | ✅ `TestCarBatchWindow` | 2초 뒤 온 로봇은 함께, 계획 뒤 온 로봇은 다음. 2.75초엔 계획 없음, `call` 1번 |
+| 모두 수락 + 문 열림 전에는 turn 없음 | ✅ `TestCarAllAcceptBeforeBoarding` | 2/3 수락이면 turn 0, 마지막 수락 즉시 7층 로봇부터. `opening`이면 turn 없음 |
+| 수락 없음 → 중단 | ✅ `TestCarAbortOnMissingAccept` | 10초에 중단, 수락 안 한 로봇만 fault, `release`, turn 0, 바로 재계획 가능 |
+| 엘리베이터 응답 없음 → 중단 + 30초 쉼 | ✅ `TestCarAbortWhenElevatorSilent`, `TestCarAbortWhenCarNeverOpens` | 상태 5초 없음 / 다른 층에 머묾. 로봇 fault 없음, `call`은 같은 `cmd_id`로 재전송 |
+| 한 대씩: 다음 turn은 앞 turn이 닫히고 `door_zone: 0`이 온 뒤에만 | ✅ `TestCarOneAtATime` (리뷰 뒤 고침) | 다른 `n`·로봇·운행의 `zone` 무시, 문 구역에 로봇이 있는 동안 14초·40초가 지나도 다음 turn 없음(같은 `n` 재전송만), 비면 같은 로봇 재시도, 또 시간 초과면 `unsure_in` 후 다음, 하차는 칸 순서 |
+| 문 유지·해제 | ✅ `TestCarDoorHoldAndRelease` | 5초마다 `hold`, 마지막 로봇 전 `release` 0번, 끝에 정확히 1번 |
+| 하차 실패 → 재시도 → 다음 층(뒤 로봇도) | ✅ `TestCarExitRetryThenCarry` | 넘겨진 로봇들이 다음 층에서 먼저(문 쪽) |
+| 마지막 층 하차 실패 → 사람 필요 | ✅ `TestCarStuckAtLastStop` | `stuck` notice, 5분 동안 새 운행 없음, 임대 경보, ONLINE으로 보이면 반환 |
+| 임대 만료는 경보만 | ✅ `TestCarLeaseFreesOnlyWhenSafe` | 로봇이 안에 있는 동안 반환·`release` 없음 |
+| 재시작: retained 운행 이어받기 | ✅ `TestCarRestoreMidTrip` | 같은 `n`으로 turn 재전송, `hold` 다시, 새 실행 ID의 `cmd_id`. `planned`면 fault 없이 중단 |
+| 늦은 `zone`, 빼기 규칙 | ✅ `TestCarLateAnswersAndDrop` | 대기 중 로봇만 뺄 수 있음, 늦은 `clear`로 확정, 탑승 시간 초과 뒤 로비에서 ONLINE이면 `left` |
+| 설정 파일 | ✅ `TestParseConfig` | 기본값, 층별 로비, timing 일부, 잘못된 파일 7가지, `""`·`none` |
+
+### 작업 연결 (`internal/task/ride_test.go`)
+
+| 테스트 | 상태 | 리뷰 |
+|---|---|---|
+| 로비 `goto`(`.L`) → 대기 → `ride`(`.R`) → 지점 `goto` | ✅ `TestRideLegPhases` | 탑승 뒤 60초 무응답·OFFLINE이어도 작업 유지, 이벤트 순서 전체, 자기 retained 메아리 무시 |
+| 엘리베이터가 서지 않는 층 → FAILED, 같은 층은 그냥 goto | ✅ `TestRideNoElevatorForFloorFails` | |
+| 두 번째 구간이 다른 층 | ✅ `TestRideSecondLegOnOtherFloor` | |
+| 중단 → 같은 로비에서 다시 대기 | ✅ `TestRideAbortReturnsRobotsToTheQueue` | 옛 ride를 겨냥한 `cancel`, 시도 0, 쉰 뒤 새 `cmd_id` |
+| 수락 안 한 로봇만 책임 | ✅ `TestRideMissingAcceptBlamesThatRobotOnly` | 3초마다 재전송 |
+| 배터리 위험 | ✅ `TestRideCriticalBattery` (3가지) | 로비 대기·`planned`는 돌려줌(시도 0), 탑승 turn 뒤엔 아무 명령 없음(`dock`도), 내린 뒤 `goto`에서 돌려줌 |
+| 엉뚱한 층 하차 | ✅ `TestRideWrongFloorReplans` | 그 층 로비로, `replanned` |
+| 사용자 취소 | ✅ `TestRideUserCancel` | 대기 중이면 빠짐, 탄 뒤면 내려 줌 |
+| 재시작 | ✅ `TestRideRestartMidTrip`, `TestRideRestartWithoutTrip` | 운행 이어받으면 유예 뒤에도 재배정 없음 / 운행 없으면 물어보고 `cancel` 후 재대기 |
+| 로봇 이벤트 seq 순서 | ✅ `TestRobotEventsRecordedInOrder` | 3·1·2 → 1·2·3, 중복 무시, 빈 번호 1초 뒤 건너뜀, 새 `boot` |
+| `GET /elevators` | ✅ `TestElevators` (`internal/api`) | |
+
+### 통합 (`internal/sim/elevator_test.go`)
+
+모든 테스트는 50 ms마다 ① 문 구역에 2대 이상 ② 한 작업을 두 로봇이 몲 ③ OFFLINE(허용한 테스트 제외) ④ 구간 완료 때 로봇의 실제 층 ≠ 지점 층이면 실패.
+
+| 테스트 | 상태 | 리뷰 |
+|---|---|---|
+| 1층에서 3·7·5층 함께 | ✅ `TestRideThreeFloorsTogether` | 운행 1번, 문 기록 정확히 7·5·3 탑승 / 3·5·7 하차, 문 구역 최대 1대, 3대 모두 IN_ELEVATOR·OFFLINE 0, 로봇 이벤트 seq 순 |
+| 하차 실패 1번 / 2번(넘김 후 되돌아옴) | ✅ `TestRideExitFailsOnceThenSucceeds`, `TestRideExitFailsTwiceIsCarried` | |
+| 마지막 층 문 막힘 | ✅ `TestRideStuckAtLastStopNeedsHuman` | 다른 로봇에게(시도 1), 엘리베이터 `blocked`, `Rescue` 후 완료 |
+| 엘리베이터 응답 없음 | ✅ `TestRideElevatorUnresponsiveAborts` | 탑승 turn 0, 살아나면 완료·시도 0 |
+| 엉뚱한 층 하차 | ✅ `TestRideWrongFloorExitIsReplanned` | |
+| 예고보다 늦은 와이파이 / 훨씬 늦음 | ✅ `TestRideLinkLaterThanAnnounced`, `TestRideLinkLostAfterExit` | STALE만·같은 로봇 완료 / OFFLINE → 다른 로봇(시도 1) |
+| 작업 10개·로봇 4대 | ✅ `TestRideMixedLoad` | 모두 DONE·시도 0, 함께 탄 운행 1번 이상 |
+| 시드 반복 | ✅ 수동 | 임시 테스트로 시드 60개 × 2종(지연, 응답 15% 유실 + 하차 실패 + 엉뚱한 층): 모두 완료, 문 구역 최대 1대 |
+| 실제 환경 | ⬜ 6b | |
+| 🔧 엘리베이터 벤더 어댑터 2종 | 🔧 | 6b 이후 |
+
+### 변이 실험 (6a)
+
+파일 백업 → 한 곳 바꿈 → `go test` → 복원, 40여 개. 모두 적어도 한 테스트가 실패했다. 처음 살아남은 3개는 테스트를 고쳐 잡았다:
+`planned` 운행 재시작 시 이어가기(다른 경로로 중단돼 통과 → 사유·fault 검사 추가), 자기 실행의 retained 운행 수락(늦은 메아리 검사 추가),
+배터리 변이 2개는 컴파일 오류라 다시 씀. sim에서만 살아남는 2개(탑승 중 로봇에 평소 규칙, 중단 시 `cancel` 생략)는 단위 테스트가 잡고, sim에서는 IN_ELEVATOR·지켜보기가 이중 안전으로 막는다.
+
+### 6a 리뷰 (2026-11-03, 모두 수정함)
+
+리뷰어 증명 R1~R6: 원래 테스트를 수정 전 코드(리뷰어 사본)에서 돌려 6개 모두 실패, 수정 후 코드에 그대로 넣어 R1·R2·R3·R5·R6 통과(R4 원본은 흐름이 바뀌어 "no turn"으로 멈춤: 바뀐 흐름에 맞춘 것을 넣음).
+옮긴 테스트는 `internal/elevator/review_test.go`, `internal/task/review_ride_test.go`, `internal/sim/review_test.go`.
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 높음 | 하차 turn에 답이 없으면 `unsure_out` → 다시 turn을 받지 못해 엘리베이터가 영원히 묶이고 작업은 영원히 RUNNING | 열린 turn을 5초마다 같은 `n`으로 재전송. 하차 시간 초과는 "아직 안에 있음"(실패한 시도) → 재시도 → 다음 층으로 → 마지막 층이면 `stuck`(작업은 다른 로봇에게, 한 번만), `blocked`에서는 1분마다 그 층에서 문을 다시 열고 하차 turn을 다시 줌. 임대 만료 시 확인 안 된 로봇마다 `stuck` 알림. `unsure_out` 없앰 | `TestReviewUnansweredExitIsRetriedNotStranded`(R1), `TestReviewTaskSettledAfterUnansweredExit`(R6), `TestReviewLeaseSettlesRobotInside` |
+| 2 높음 | 이어받은 운행이 옛 `boot`를 유지 → 자기 retained 메아리를 다시 받아 좀비 운행·반복 | 이어받을 때 `boot`를 새 실행 ID로, 끝난 운행 ID를 기억해 무시, 끝나면 마지막 단계를 보낸 뒤 retained 메시지를 지움(`Link.ClearTrip`, 빈 retained 발행) | `TestReviewRestoredTripEchoIgnored`(R5), `TestReviewTripPublishRetriedAndCleared` |
+| 3 높음 | 시간 초과 뒤 앞 로봇의 문 구역이 정리되지 않았는데 다음 로봇에게 turn → 문 구역에 두 대. sim 문 이동(2초)이 시간 초과(15초)보다 짧아 잡지 못함 | 엘리베이터 상태에 `door_zone`(문 구역 수: 엘리베이터 센서, mock은 `zone` `enter`/`clear`/`failed`로 셈). 다음 turn은 앞 turn이 닫힌 **뒤에 받은** `door_zone: 0` 상태가 있어야 함. 시간 초과는 같은 로봇의 재시도일 뿐 뒤 로봇을 움직이지 않음. sim 로봇이 `enter`를 보내고, 문 이동 시간을 시간 초과보다 길게 할 수 있음 | `TestReviewTimeoutDoesNotGrantNext`(R2), `TestCarOneAtATime`(고침), sim `TestRideRobotsSlowerThanTurnTimeout`(문 이동 40초 > turn + 재시도 30초, 문 구역 최대 1대, 시작 뒤 반드시 자기 끝) |
+| 4 중상 | 문이 닫힌 채로 turn(재시작 뒤 유지 시간 만료, 하차 중 스스로 닫힘) | turn마다 "최근 5초 안에 그 층·그 운행으로 문 열림"을 확인, 아니면 turn 없이 같은 층 `goto`(5초마다)로 다시 염. 재시작 때는 `hold` 대신 `goto`, 문이 열린 것을 본 뒤 turn 재전송. 탑승·하차 중 무응답이면 `overdue`("car not answering") | `TestReviewNoTurnWithDoorClosed`(R3), `TestCarRestoreMidTrip`(고침) |
+| 5 중 | 늦게 온 하차 `failed`가 로봇을 차 뒤쪽 층으로 넘겨 하차 순서가 깨짐 | 넘김은 지금 정차층 기준 다음 층만. 늦은 하차 `failed`는 무시(시간 초과가 이미 "안에 있음"으로 셈). 하차 turn은 안에 있을 수 있는 로봇 중 가장 문 쪽 로봇에게만, 그 로봇이 여기서 안 내리면 뒤 로봇도 넘김 | `TestReviewLateExitFailureKeepsOrder`(R4), `TestReviewCarryOnlyFromTheFailedRobotBack` |
+| 6 중 | 넘겨진 로봇이 나올 자리를 모름 | `turn`에 그 층의 로비 `lobby`(x, y). sim은 turn의 로비로 나옴 | `TestReviewNoTurnWithDoorClosed`(lobby), sim 테스트 전부 |
+| 7 중 | 발행 대기열이 차거나 브로커가 끊기면 retained 운행이 오래된 채로 남음 | 운행을 10초마다, MQTT 재연결 때(`mqttx.Client.Connected`, `RepublishTrips`) 다시 발행, 발행 실패는 다음 진행에서 재시도. main의 `outbox`(별도 파일): 로봇 명령 512개 제한(예전과 같음), 엘리베이터 명령·turn은 거절 없음(2,048개 넘으면 가장 오래된 것을 버리고 기록: 지휘자가 재전송), 운행은 버리지 않고 같은 엘리베이터의 새 것으로 대체, 실패하면 1초 뒤 재시도 | `TestReviewTripPublishRetriedAndCleared`, `TestOutboxLimitsAndCoalescing`, `TestOutboxRetriesTrips` |
+| 8 중 | 탑승 전 취소 대상을 `cmd_id`의 첫 `.x`로 잘라 냄(서버 실행 ID가 `x`로 시작할 수 있음) | `cancel`에 `target` 필드. 문서·sim 갱신 | `TestRideAbortReturnsRobotsToTheQueue`, `TestReviewReleaseElevator` |
+| 9 낮중 | 사람이 처리한 뒤 묶인 엘리베이터를 풀 방법이 없음 | `POST /elevators/{id}/release`(같은 JSON·사이트 규칙): 운행 끝, retained 지움, 탑승 전 로봇은 다시 대기, 확인 안 된 로봇의 작업은 시도 없이 대기열로 + 지켜보기, `released` 이벤트 | `TestReleaseElevator`(api: 404·409·415·403·200), `TestReviewReleaseElevator`, `TestReviewForceRelease` |
+| 10 낮음 | `zone` 값 검증 없음, 자기 층 대기 로봇이 영원히 대기, 0인 시간 설정, `hold_refresh_s ≥ hold_for_s`, 낡은 주석 | 모르는 action·event·이 turn과 다른 action은 기록 후 무시(시도 안 씀). 목적층 = 대기 층이면 `no_ride` → 그 구간을 그냥 `goto`로. timing은 모두 0보다 커야 하고 `hold_refresh_s < hold_for_s`. proto 주석 고침 | `TestReviewZoneValuesValidated`, `TestReviewSameFloorWaiterNeedsNoRide`, `TestReviewNoRideNeeded`, `TestReviewParseTimingRules` |
+| 리뷰 중 발견 | sim의 turn 유실 테스트가 찾음: 탑승 turn이 열려 있는(유실된) 로봇이 로비에서 ONLINE으로 보이자 "타지 않음"으로 처리해 운행을 버림 | 열린 탑승 turn의 로봇은 와이파이로 정리하지 않음(재전송·재시도가 처리). 늦게 온 탑승 `clear`는 재시도 대기 중이어도 받아들임, 이미 한 일의 새 turn에 로봇은 `clear`로 답함 | sim `TestRideLostTurnAndZone`(turn 2번 유실 + 답 1번 유실) |
+| 문서 | ELEVATOR.md 모순("시간 초과면 다음 로봇") 등 | "한 대씩"은 `door_zone` 규칙으로 보장. 다른 운행·`done` 뒤 turn 무시, retained `trip.turn`으로 움직이지 않음, 차 안에서 exit turn이 없으면 기다림, `hold`는 닫힌 문을 다시 열지 않음(같은 층 `goto`로 엶, sim도 같게), mock의 문 구역 세기(turn과 무관), `stuck`과 운영자 반환, `cancel.target`, 어댑터는 계획보다 `cmd_id` 중복을 먼저 확인 | |
+
+**누락 테스트·살아남은 변이 8개**(리뷰어): 모두 잡는 테스트를 넣고 변이를 다시 넣어 확인 — 하차 시간 초과를 "내림"으로(`TestReviewUnansweredExit…`, `…LateExitFailure…`),
+문 쪽 로봇 무시하고 넘김(`TestCarExitRetryThenCarry`, `…CarryOnlyFromTheFailedRobotBack`), 와이파이 정리에서 "turn 뒤에 들림" 무시(`TestReviewAccountNeedsReportAfterTurn`),
+상태 중복 제거 없음(`TestReviewStateDeduplicated`), 임대 만료가 탑승 전 운행을 중단 안 함(`TestReviewLeaseAbortsUnboardedTrip`), 이어받은 ride를 확인 표시 안 함(`TestReviewRestoredRideConfirmed`),
+늦은 하차 `failed`로 다시 넘김(`TestReviewLateExitFailureKeepsOrder`), 기다리는 중 같은 seq 이벤트 중복 기록(`TestReviewRobotEventDuplicateWhileWaiting`).
+
+**변이 실험(수정 후):** 위 8개 + 새 규칙 24개(문 구역 확인 없이 turn, 문 닫힌 채 turn, 시간 초과에 다음 로봇, turn 재전송 없음, 이어받을 때 옛 boot, 끝난 운행 기억 안 함, retained 안 지움,
+주기 재발행 없음, 발행 실패 재시도 없음, `blocked` 재시도 없음, 임대 만료 `stuck` 알림 없음, zone 검증 없음, `no_ride` 무시(car·task), 탑승 turn 열린 로봇 정리, 운영자 반환 후 재배정 없음,
+`cancel.target` 없음, outbox 운행 재시도·대체 없음, 설정 0·hold 순서) + 1차 변이 23개 다시: 모두 적어도 한 테스트가 실패.
+sim 쪽에서 처음 살아남은 2개(문 구역 확인 없이 turn, turn 재전송 없음)는 sim 테스트를 강하게 해서(문 이동 40초, turn 2번 유실) 잡음.
+살아남은 1개는 동치: `RestoreTrip`의 "자기 boot면 무시"는 이제 "끝난 운행 무시 + 운행 중이면 무시"에 포함된다(이 실행의 운행은 진행 중이거나 끝났거나 둘 중 하나).
 
 ## 7단계: 마무리 (계획)
 

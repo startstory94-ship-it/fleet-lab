@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"fleetlab/internal/elevator"
 	"fleetlab/internal/fleet"
 )
 
@@ -53,6 +54,18 @@ type Task struct {
 	// another eligible robot is free.
 	FailedOn []string `json:"failed_on,omitempty"`
 
+	// A leg whose waypoint is on another floor goes through an elevator:
+	// Phase is "" for a plain goto to the waypoint, else PhaseLobby,
+	// PhaseWait or PhaseRide (ride.go). They are persisted so a restart knows
+	// what CmdID is.
+	Phase    string `json:"phase,omitempty"`
+	Elevator string `json:"elevator,omitempty"` // car of the current ride
+	From     int    `json:"from,omitempty"`     // floor whose lobby the robot uses
+	Trip     string `json:"trip,omitempty"`     // trip of the ride command
+	// Hops counts elevator commands (lobby goto, ride) of this dispatch; it
+	// is part of their cmd_ids so each one is new to the adapter.
+	Hops int `json:"hops,omitempty"`
+
 	Created  time.Time `json:"created"`
 	Updated  time.Time `json:"updated"`
 	Started  time.Time `json:"started,omitzero"` // first accepted leg
@@ -68,6 +81,7 @@ type Task struct {
 	restoreUntil time.Time // grace end; zero until the first MQTT connection
 	probed       bool      // restored leg was re-sent once to ask the robot
 	handBack     bool      // battery critical: robot cancelled, requeue once it stopped
+	strayRide    time.Time // robot reports a ride whose trip is gone, since
 }
 
 func (t *Task) active() bool { return t.State == Assigned || t.State == Running }
@@ -75,11 +89,18 @@ func (t *Task) active() bool { return t.State == Assigned || t.State == Running 
 // Command is published to fleet/<robot>/cmd.
 type Command struct {
 	CmdID     string  `json:"cmd_id"`
-	Type      string  `json:"type"` // goto, cancel, dock
+	Type      string  `json:"type"` // goto, cancel, dock, ride
 	X         float64 `json:"x"`
 	Y         float64 `json:"y"`
 	Yaw       float64 `json:"yaw"`
 	ExpiresAt float64 `json:"expires_at"` // unix seconds
+	// Target is the cmd_id a cancel is aimed at. A ride is dropped only if it
+	// is the robot's current ride (see docs/ELEVATOR.md); a goto is stopped
+	// as before.
+	Target string `json:"target,omitempty"`
+	// Ride is the robot's part of an elevator trip (type ride). A re-sent
+	// ride after the trip ended may carry none: it only asks for the last ack.
+	Ride *elevator.RidePlan `json:"ride,omitempty"`
 }
 
 // Ack arrives on fleet/<robot>/cmd_ack.
@@ -87,20 +108,26 @@ type Ack struct {
 	CmdID   string `json:"cmd_id"`
 	Status  string `json:"status"` // accepted, done, failed, cancelled
 	Message string `json:"message"`
+	// Floor is where the robot is when it acks a ride done (it may differ
+	// from the plan: carried past a blocked door, or out at a wrong floor).
+	Floor *int `json:"floor,omitempty"`
 }
 
-// Event reports a task state change or a battery policy step.
+// Event reports a task state change, a battery policy step or an elevator
+// step.
 type Event struct {
-	Type  string // task, battery
+	Type  string // task, battery, elevator
 	Time  time.Time
 	Task  string
 	Robot string
 	// task: assigned, running, leg_done, done, requeued, failed, cancelled
 	// battery: low, dock_sent, docking, charged, dock_failed
-	Kind   string
-	From   string // task state before
-	To     string // task state after
-	Detail string
+	// elevator: see docs/ELEVATOR.md
+	Kind     string
+	From     string // task state before
+	To       string // task state after
+	Detail   string
+	Elevator string // car id for elevator events
 }
 
 // RobotSource gives the current view of every robot (fleet.Registry).

@@ -306,7 +306,8 @@ def battery_steps(start_mock):
     bat, x0 = "bat_1", 25.0
     start_mock("bat", ["--count", "1", "--prefix", "bat", "--origin-x", str(x0), "--battery", "30",
                        "--drain-per-m", "3", "--charge-rate", "10"])
-    ok = wait_for(lambda: (robot(bat) or {}).get("conn") == "ONLINE" and robot(bat)["mode"] == "IDLE", 20)
+    ok = wait_for(lambda: (robot(bat) or {}).get("conn") == "ONLINE" and robot(bat)["mode"] == "IDLE"
+                  and robot(bat)["has_pose"], 20)  # no pose yet: not assignable (stage 4)
     step("low-battery robot bat_1 ONLINE", bool(ok), robot(bat))
     if not ok:
         return
