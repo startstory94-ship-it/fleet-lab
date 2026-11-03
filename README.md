@@ -1,13 +1,180 @@
 # fleet-lab
 
-ROS 2 mock 로봇과 Go 관제 서버(fleetd)로 만드는 로봇 플릿 관제 실험실.
-핵심 기능은 목적층이 다른 로봇을 엘리베이터에 함께 태우는 것이다. 설계와 단계는 [PLAN.md](PLAN.md)에 있다.
+목적층이 다른 로봇 여러 대를 엘리베이터 한 대에 함께 태우는 로봇 관제 서버(Go)와, 그것을 실제 프로세스로 돌려 보는 실험실.
+ROS 2 mock 로봇 → 어댑터(Python) → MQTT(Mosquitto) → 관제 서버 `fleetd`(Go) → 대시보드(브라우저)까지 모두 들어 있고, 엘리베이터도 MQTT로 붙는 mock이다.
+
+## 왜 만들었나
+
+현업에서 로봇 여러 대를 엘리베이터에 태울 때, **목적층이 같은 로봇끼리만** 함께 태울 수 있었다.
+
+- 엘리베이터 안에서는 로봇 와이파이가 끊겨 엘리베이터 통신만 살아 있었고, 나머지는 오프라인으로 처리해야 했다.
+- 목적층이 다르면 누가 먼저 내릴지, 안쪽 로봇이 내릴 때 문 쪽 로봇을 어떻게 비킬지 정리하기 어려웠다.
+- 좁은 칸에서 두 로봇이 동시에 움직이면 멀티로봇 회피가 제대로 동작하지 않았다.
+
+그래서 목적층이 다른 로봇을 함께 태우는 기능은 내지 못했다. 이 프로젝트는 그 문제를 이렇게 푼다.
+
+1. **탑승 전에 서버가 계획한다.** 하차는 가까운 층부터, 탑승은 그 반대(가장 멀리 가는 로봇이 먼저 타서 안쪽). 그러면 어느 층에서든 내릴 로봇이 문 쪽에 있다.
+2. **계획은 와이파이가 있는 로비에서 미리 내려보낸다.** 모두 수락해야 탑승을 시작한다. 차 안에서는 서버와 말할 수 없다는 전제다.
+3. **문은 한 번에 한 대.** 서버가 엘리베이터 채널로 한 로봇에게만 차례(turn)를 주고, 엘리베이터가 문 구역이 비었다고 알려야 다음 로봇에게 준다.
+
+1~5단계(연결, 끊김, 작업 배정, 배터리, 대시보드)는 이 이야기를 위한 기반이고, 6단계가 핵심, 7단계는 CI·부하 테스트·정리다. 계획은 [PLAN.md](PLAN.md).
+
+## 구조
+
+```mermaid
+flowchart LR
+  M["mock_fleet.py<br/>ROS 2 mock 로봇<br/>층·탑승·끊김"] -->|"ROS 2 토픽·서비스"| A["fleet_adapter.py<br/>rclpy + paho-mqtt"]
+  A -->|"fleet/robot/pose·state·event·cmd_ack<br/>elevator/id/zone"| B[("Mosquitto")]
+  B -->|"fleet/robot/cmd<br/>elevator/id/turn·state·trip"| A
+  E["mockelevator (Go)<br/>층·문·door_zone"] -->|"elevator/id/state"| B
+  B -->|"elevator/id/cmd·zone"| E
+  B -->|"로봇·엘리베이터 메시지"| F["fleetd (Go)"]
+  F -->|"명령·turn·retained trip"| B
+  F -->|"REST · /ws 이벤트 · /ws/live 위치 묶음"| D["대시보드<br/>HTML+JS, go:embed"]
+```
+
+fleetd 안:
+
+```mermaid
+flowchart TB
+  Q["mqttx<br/>재접속 백오프 + jitter"] --> R["fleet.Registry<br/>seq · ONLINE/STALE/OFFLINE/IN_ELEVATOR"]
+  Q --> T["task.Manager<br/>배정 · 재전송 · 지켜보기 · 배터리 · 엘리베이터 단계"]
+  T --> C["elevator.Car<br/>탑승 계획 · turn · door_zone · 실패 · 임대"]
+  T --> S[("SQLite<br/>작업")]
+  T --> O["outbox<br/>발행 대기열"] --> Q
+  R --> L["live.Broadcaster<br/>바뀐 로봇만, 1번 인코딩"]
+  R --> H["events.Hub<br/>이벤트 번호 · 최근 200개"]
+  L --> API["api<br/>REST · /ws · /ws/live"]
+  H --> API
+  T --> API
+```
+
+글자로 보면:
+
+```
+[mock_fleet.py] --ROS 2--> [fleet_adapter.py] --MQTT--> [Mosquitto] <--MQTT--> [fleetd] --HTTP/WebSocket--> [브라우저]
+                                                             ^
+                                          [mockelevator] ----+  (엘리베이터 채널: 차 안 로봇도 이것만은 쓴다)
+```
+
+## 빠른 시작
+
+필요한 것: Go 1.27+, Mosquitto(127.0.0.1:1883), ROS 2 Jazzy(pixi, `C:\pixi_ws`) + `paho-mqtt`. Windows 기준.
+
+```bat
+scripts\demo.bat
+```
+
+mock 엘리베이터, fleetd, 1층 mock 로봇 3대(로밍 끊김 포함), 9층 2대, 어댑터가 각각 창으로 뜬다. 브라우저에서 http://127.0.0.1:8080/ 을 연다.
+지도를 클릭하면 그 자리로 작업이 간다. 로봇 5대가 모두 ONLINE이 되면 함께 타기를 본다:
+
+```bat
+powershell -ExecutionPolicy Bypass -File scripts\demo_tasks.ps1 up
+rem 1층 3대 → 2·4·3층: 운행 1번, 탑승 4·3·2, 정차 2·3·4
+powershell -ExecutionPolicy Bypass -File scripts\demo_tasks.ps1 down
+rem 9층 2대 → 8·7층
+```
+
+오른쪽 위 엘리베이터 칸에서 층·문·문 구역 수·칸별 로봇·단계가 보이고, 차가 있는 층을 고르면 차 안 로봇이 보라색으로 그려진다. 하나씩 띄우는 방법은 아래 [실행](#실행).
+
+## 화면
+
+> 스크린샷과 GIF는 아직 없다. 넣을 장면: ① 1층 로봇 3대가 7·5·3 순서로 타는 모습(문 구역 1대) ② 엘리베이터 칸의 칸별 로봇과 내릴 층
+> ③ 로밍 끊김(STALE 점선 → 복구) ④ 하차 실패 → "넘겨짐" → 다음 층. 찍으면 `docs/images/`에 두고 여기에 링크한다.
+
+## 단계별 기능
+
+| 단계 | 한 일 | 자세히 |
+|---|---|---|
+| 1 연결 | 어댑터가 ROS 2 ↔ MQTT 변환(위치 5 Hz·데드밴드, 상태 1초, LWT, 재접속 백오프 + jitter). 서버는 seq로 옛 메시지·중복을 버린다 | [MQTT 토픽](PLAN.md#3-메시지-설계), [API](#api) |
+| 2 끊김 | 서버가 받은 시각으로 ONLINE / STALE(2초) / OFFLINE(20초·LWT), 복구는 연속 3번. 이벤트 번호로 순서 보장, `/ws` 스트림 | [연결 상태](#연결-상태) |
+| 3 작업 | 지점 목록 작업, 가장 가까운 로봇 배정, `cmd_id` + 유효 기간 + 3초 재전송, 응답 유실 복구, 두 로봇이 같은 작업을 하지 않게 지켜보기, SQLite 저장과 재시작 복구 | [작업](#작업) |
+| 4 배터리 | 25% 미만 제외·90%에서 해제(히스테리시스), 일을 마친 뒤 도크, 10% 미만이면 작업을 돌려줌 | [배터리](#배터리) |
+| 5 대시보드 | 바뀐 로봇만 담은 위치 묶음을 0.15초마다 **한 번만** 인코딩해 모든 브라우저에, 느린 브라우저는 옛 묶음을 버리고 스냅샷으로 다시 맞춤. 브라우저는 보간 | [대시보드](#대시보드) |
+| 6 엘리베이터 ⭐ | 탑승 계획(순수 함수), 로비에서 미리 수락, 한 대씩 turn + `door_zone`, 하차 실패 → 재시도 → 다음 층, 갇힘 → 사람 호출·운영자 반환, retained 운행으로 재시작 이어받기. mock 엘리베이터·mock 로봇·어댑터까지 실제 프로세스로 | [엘리베이터](#엘리베이터-6단계), [docs/ELEVATOR.md](docs/ELEVATOR.md) |
+| 7 마무리 | GitHub Actions(`go test -race` 포함), 실제 fleetd를 상대로 한 부하 테스트(`cmd/loadtest`), 이 README | [docs/LOAD_TEST.md](docs/LOAD_TEST.md), [CI](.github/workflows/ci.yml) |
+
+## 설계 결정
+
+| 결정 | 이유 |
+|---|---|
+| **로봇 안 어댑터 + MQTT**, 서버는 ROS 2(DDS)에 직접 붙지 않음 | DDS 탐색·멀티캐스트는 현장 네트워크와 클라우드 사이를 잘 넘지 못한다. 로봇마다 어댑터가 MQTT로 말하는 구조가 일반적이다(Open-RMF fleet adapter와 같은 패턴). LWT·retained로 끊김을 표현하기 좋고, Go용 ROS 2 라이브러리 없이 Windows에서 빌드된다. 로봇을 Nav2로 바꿔도 어댑터만 바뀐다 |
+| **엘리베이터도 MQTT, 로봇과 다른 채널** | 현장 조건 재현: 차 안에서 로봇 와이파이(`fleet/*`)는 끊기지만 엘리베이터 채널은 산다. 어댑터는 탑승부터 하차 1초 뒤까지 `fleet/*` 발행을 실제로 멈춘다(e2e가 메시지 0개를 확인) |
+| **문 차례(turn)는 서버가 준다** | 로봇끼리 순서를 정하게 하면 차 안에서 서로를 볼 방법이 없다. 서버(지휘자)가 한 로봇에게만 turn을 주고 답(`clear`/`failed`)을 받는다. 열린 turn은 5초마다 같은 번호로 다시 보내 유실을 메우고, 로봇은 같은 번호에 같은 답을 한다 |
+| **다음 turn은 `door_zone: 0`을 본 뒤에만** | 시간 초과로 다음 로봇을 움직이면 앞 로봇이 아직 문에 있을 때 두 대가 겹친다(6a 리뷰에서 실제로 찾음). 엘리베이터 센서(mock은 `enter`/`clear`로 셈)가 문 구역이 비었다고 알려야 다음으로 간다. 시간 초과는 같은 로봇의 실패한 시도로만 센다 |
+| **운행 상태는 retained `elevator/{id}/trip`** | fleetd가 탑승 중에 재시작해도 브로커에 남은 운행을 이어받는다(탑승 전이었으면 안전하게 중단). 끝나면 지우고, 끝난 운행 ID를 기억해 자기 메아리를 무시한다 |
+| **배터리 히스테리시스 25% / 90%** | 하나의 기준이면 25% 근처에서 배정·제외가 반복된다. 90%까지 충전해야 다시 배정한다. 충전기가 90% 전에 멈추면 한 번만 다시 보내 끝없는 도크 왕복을 막는다 |
+| **위치 묶음은 한 번만 인코딩, 느린 브라우저는 버림** | 서버 → 브라우저 전송량은 로봇 수 × 브라우저 수 × 빈도로 커진다. 묶음을 브라우저마다 만들면 인코딩도 브라우저 수만큼 늘고, 느린 브라우저를 기다리면 모든 브라우저가 그 속도로 떨어진다. 부하 테스트(로봇 500대): 브라우저 60개에서 브라우저마다 인코딩하면 fleetd CPU 13% → 26%, 지연 중앙값 1.0 → 7.7 ms. 느린 브라우저 2개를 기다리면 빠른 브라우저도 초당 6.7 → 2.0개, p99 지연 1.6 ms → 1초. 대신 버림 방식에서도 느린 브라우저가 보는 상태는 몇 초(중앙값 3.3초) 묵는다(알려진 한계) |
+| **명령은 `cmd_id` + `expires_at`, 응답 없으면 같은 ID로 재전송** | QoS 1 중복과 응답 유실을 함께 다룬다. 어댑터는 같은 ID를 다시 실행하지 않고 마지막 응답을 다시 보내므로, `done`이 유실돼도 재전송으로 되찾는다. 재연결 뒤 옛 명령은 유효 기간으로 막는다 |
+| **끊김 판단은 서버가 받은 시각, 순서는 seq** | 로봇과 서버의 시계 차이와 상관없다. 같은 로봇의 옛 메시지·중복은 seq로 버리고, 어댑터 재시작은 `boot`로 구분한다 |
+
+## 테스트
+
+| 종류 | 개수 | 어디 | 무엇을 |
+|---|---|---|---|
+| Go 전체 | 테스트 함수 207개 (아래 sim 포함, 하위 테스트까지 271개; `go test -list . ./...`, `go test -v ./...`의 `--- PASS` 줄), 몇 초 | `internal/*`, `cmd/*` | seq·연결 상태·배정·재전송·배터리·묶음·계획·지휘·API·mock 엘리베이터. 로직은 가짜 시계, HTTP/WebSocket은 `httptest` |
+| 통합 sim (Go) | 19개 | `internal/sim` | ROS·MQTT 없이 실제 `Registry`·`Manager`에 가짜 로봇·엘리베이터를 붙임. 지연·순서 뒤바뀜·응답 유실·실패 주입, 50 ms마다 "문 구역 1대·한 작업 한 로봇" 검사 |
+| 성질 (property) | 무작위 5,000개 | `internal/elevator` `TestPlanProperties` | 매 정차층에서 내릴 로봇이 모두 문 쪽, 칸 수, 방향, 결정성, 입력 순서 무관 |
+| 변이 실험 | 단계마다 수동 (6단계만 70여 개) | [TEST_PLAN](docs/TEST_PLAN.md) | 조건 하나를 일부러 깨서 적어도 한 테스트가 실패하는지 확인. 살아남은 변이는 테스트를 보강 |
+| 어댑터 (pytest) | 74개 | `adapter/` | ROS 없이: 순수 로직(`fleet_logic.py`), 가짜 rclpy·paho로 배선(`test_adapter_wiring.py`) |
+| 대시보드 JS (node) | 31개 | `scripts/web_test.js` | 보간·외삽, 격자 상한, 이벤트 빈틈 채우기, 엘리베이터 칸·경보 계산 |
+| 끝단 e2e | 시나리오 71개 (약 5분 반) | `scripts/e2e.bat` | Mosquitto + fleetd + mock 엘리베이터 + ROS 2 mock 로봇 + 어댑터를 실제로 띄움. 함께 타기 3·7·5층, 하차 실패, turn 유실, 갇힘 → 반환 → 꺼냄, 서버 재시작, 배터리, `/ws/live` |
+| 부하 | 설정 9가지 × 3번 (약 9분) | `cmd/loadtest` | 실제 fleetd에 가짜 로봇 500대(MQTT)와 브라우저 20개(WebSocket). [docs/LOAD_TEST.md](docs/LOAD_TEST.md) |
+
+CI(GitHub Actions, [ci.yml](.github/workflows/ci.yml)): gofmt·`go vet`·`go test -race`·Windows 빌드, node, pytest(ROS 없이),
+Mosquitto를 깔고 작은 부하 테스트(로봇 300대, `-check`)로 fleetd가 실제로 뜨고 붙는지, 브라우저 오류가 없는지, 느린 브라우저 때문에 묶음을 실제로 버리고 스냅샷으로 다시 맞추는지 확인. e2e는 ROS 2가 필요해 로컬에서만 돌린다.
+이 PC에는 C 컴파일러가 없어 `-race`는 CI에서만 돈다.
+
+## 부하 테스트 요약
+
+[docs/LOAD_TEST.md](docs/LOAD_TEST.md)에 방법·표·해석이 있다. 한 PC(Ryzen 5 7500F, Windows 11)에서 실제 fleetd + Mosquitto에 로봇 500대(모두 이동, 위치 초당 2,500개)를 붙이고, 시나리오마다 새 fleetd로 3번씩 재서 중앙값을 적었다.
+
+| 비교 | 결과 |
+|---|---|
+| 기본 상태 (브라우저 20개, 그중 2개 느림) | fleetd CPU 한 코어의 약 9%, 묶음 80 KB × 초당 6.7개, 빠른 브라우저 지연 p50 1.0 ms · p99 1.6 ms |
+| 묶음 한 번 인코딩 vs 브라우저마다 (번갈아 3번씩) | 20개: 지연 p50 1.0 → 3.1 ms, p99 1.6 → 5.7 ms, CPU 9 → 14%. 60개: CPU 13 → 26%, p50 1.0 → 7.7 ms, p99 4.7 → 17.6 ms |
+| 느린 브라우저 버림 vs 기다림 | 기다리면 빠른 브라우저 18개도 초당 6.7 → 2.0개, p99 1.6 ms → 1,001 ms. 버리면 느린 쪽만 스냅샷으로 다시 맞추고(초당 9.6개 버림) 나머지는 그대로. 단 느린 브라우저가 보는 상태는 버림에서 중앙값 3.3초·최대 4.0초, 기다림에서 7.0·7.9초 묵음 |
+| 500대 동시 재접속 jitter vs 없음 | 100 ms당 최대 시도 약 60 vs 500. 없으면 끊김이 끝난 뒤의 시도 중 실행마다 14~188개(중앙값 2.5초 끊김 105, 3.5초 끊김 149)가 거절됨. 거절한 것은 Mosquitto가 아니라 부하 테스트 자신의 Go 프록시 listen 소켓(Windows 접속 대기열)이다. 모두 다시 붙기까지: 2.5초 끊김 8.3 vs 7.05초, 3.5초 끊김 9.4 vs 15.1초 |
+
+jitter의 의미는 평균 복구 시간보다 **몰림을 없애는 데** 있었다. 잰 두 끊김(2.5초, 3.5초)에서 jitter 쪽은 끊김이 끝난 뒤 5.7~6.0초에 모두 붙었고, jitter 없는 쪽은 4.6초와 11.6초로 끊김 길이에 따라 크게 달랐다(2.5초 끊김에서는 오히려 빨랐다). 백오프가 두 배씩 늘어나므로 더 긴 끊김에서도 jitter 쪽이 6초 근처라고 말할 수는 없다(재지 않음).
+
+## 실제 운영이라면
+
+- **보안:** MQTT는 TLS(8883)와 로봇별 인증서·계정, 브로커 ACL로 로봇은 `fleet/<자기 이름>/#`와 자기가 탈 엘리베이터 채널만 쓰게 한다(Mosquitto `pattern write fleet/%u/#`).
+  지금은 localhost에 인증 없음이다. HTTP는 운영자 인증과 HTTPS, 작업 생성·운영자 반환 같은 POST에 권한·감사 기록.
+- **배정 거리:** 지금은 직선 거리 + 층당 1000 m 가산이다. 실제로는 지도 위 경로 거리(Nav2 `ComputePathToPose`나 미리 만든 길 그래프)와 엘리베이터 대기 시간을 넣어 고른다.
+- **엘리베이터 여러 대:** 설정에 여러 대를 둘 수 있지만, 구간마다 두 층을 모두 서는 첫 번째 차(ID 순)를 쓴다. 제대로 하려면 호출을 어느 차에 줄지(대기 로봇 수, 차 위치, 사람 승객) 정하는 배정이 필요하고, 벤더별 엘리베이터 API 어댑터가 들어간다.
+- **텔레메트리:** SQLite에는 작업·이벤트만 둔다. 위치·배터리 이력이 쌓이면 TimescaleDB·InfluxDB 같은 시계열 DB로 따로 보내고 보존 기간을 둔다.
+- **이중화(HA):** fleetd는 지금 한 프로세스이고 상태가 메모리 + SQLite에 있다. 운영이면 상태를 Postgres 같은 공유 저장소로, 리더 선출로 한 대만 지휘(엘리베이터 지휘자가 둘이면 안 된다),
+  브로커는 클러스터·브리지. 재시작 이어받기(retained 운행, 25초 유예)는 이미 있으므로 그 위에 얹는다.
+- **관측:** `/live/stats` 같은 수치를 Prometheus로, 엘리베이터 갇힘·임대 초과 경보를 호출 시스템으로.
+
+## 알려진 한계
+
+- 엘리베이터: 여러 대 사이 최적 배정 없음(두 층을 서는 첫 차), 사람 승객 고려 없음. 로비 대기 자리가 점 하나. 한 칸 줄(single file) 모델이라 앞 로봇이 못 내리면 같은 층의 뒤 로봇도 넘긴다.
+  차 안에서는 와이파이가 항상 끊긴다고 가정한다("와이파이로 ONLINE이면 차 밖"). ([ELEVATOR.md 12장](docs/ELEVATOR.md))
+- 브로커가 retained 메시지를 잃으면(영속 저장 꺼짐 + 재시작) 탑승 중 운행을 이어받지 못하고 사람이 필요하다.
+- 어댑터를 탑승 중에 재시작하면 ride를 잃는다(로봇은 ERROR로 보고해 배정은 막지만, 꺼내는 것은 사람). 서버 재시작 중 탑승은 Go 테스트로만 확인했고 e2e는 없다.
+- 엘리베이터 응답 없음·문 막힘은 주입 옵션과 Go 테스트만 있고 e2e 단계는 없다. mock 로봇의 "움직이다 고장"은 자동 테스트가 없다.
+- 배터리 충전 필요 표시는 메모리에만 있어, 재시작 전에 충전이 끊겨 25~90%로 IDLE인 로봇은 표시를 잃고 바로 배정될 수 있다.
+- 화면 그리기와 클릭은 자동 테스트가 없다(수동 확인). 서버가 연결을 잡은 채 멈춘 경우의 "응답 없음" 표시는 Go 테스트로만 확인했다.
+- **느린 브라우저가 보는 상태의 나이는 묶여 있지 않다.** 버림은 빠른 브라우저를 지키고 빈틈 없이 다시 맞추지만, 0.5초마다 하나씩 읽는 브라우저는 대기열(8칸)과 소켓 버퍼에 쌓인 묶음을 차례로 읽어 3~4초 묵은 상태를 본다.
+  묶으려면 브라우저마다 "최신 하나만" 두거나 대기열을 1~2칸으로 줄이고, 소켓에 쌓이는 몫은 쓰기 버퍼를 줄이거나 흐름 제어로 막아야 한다([LOAD_TEST.md](docs/LOAD_TEST.md)).
+- 부하 테스트는 한 PC에서 fleetd·Mosquitto·부하 생성기를 함께 돌린 값이다. 로봇 500대가 모두 계속 움직이는 최악 조건이고, 다른 PC·네트워크에서는 숫자가 다르다.
+- `go test -race`와 CI 전체는 push한 뒤에야 처음 돈다(이 PC에는 C 컴파일러가 없음). 경합은 코드를 읽어 찾아 고쳤지만 실행으로 확인하지 못했다.
+
+---
+
+# 상세
+
+아래는 동작 규칙을 자세히 적은 참고 문서다.
 
 ## 폴더
 
 | 폴더 | 내용 |
 |---|---|
 | `cmd/fleetd` | 관제 서버 진입점 |
+| `cmd/loadtest` | 부하 테스트(7단계): 실제 fleetd를 띄워 MQTT 로봇 N대와 WebSocket 브라우저 M개로 CPU·지연·버림·재접속 폭풍을 잼. [docs/LOAD_TEST.md](docs/LOAD_TEST.md) |
 | `cmd/mockelevator` | MQTT mock 엘리베이터(6b): fleetd와 같은 `-elevators` 설정으로 층 이동·문·유지·`door_zone`·실패 주입 |
 | `internal/fleet` | 로봇 목록, seq 검사, 연결 상태(ONLINE/STALE/OFFLINE/IN_ELEVATOR), MQTT 메시지 수신 |
 | `internal/events` | 이벤트 배포 (느린 수신자는 건너뜀), 최근 이벤트 보관 |
@@ -21,8 +188,9 @@ ROS 2 mock 로봇과 Go 관제 서버(fleetd)로 만드는 로봇 플릿 관제 
 | `web/` | 대시보드 (HTML·CSS·JS 하나씩, 빌드 없음, 외부 CDN 없음, `go:embed`로 fleetd에 들어감) |
 | `mock_robots/` | ROS 2 mock 로봇 (Gazebo 없음) |
 | `adapter/` | ROS 2 ↔ MQTT 어댑터 |
-| `docs/` | 테스트 계획과 리뷰 기록, 엘리베이터 프로토콜(`ELEVATOR.md`) |
+| `docs/` | 테스트 계획과 리뷰 기록(`TEST_PLAN.md`), 엘리베이터 프로토콜(`ELEVATOR.md`), 부하 테스트 결과(`LOAD_TEST.md`) |
 | `scripts/` | 끝단 시나리오 테스트 (`e2e.bat`), 대시보드 JS 테스트 (`web_test.js`), 데모 실행 (`demo.bat`, 엘리베이터 작업 `demo_tasks.ps1`) |
+| `.github/workflows/` | CI (`ci.yml`): Go(gofmt·vet(Linux·Windows)·`-race`), node, pytest, Mosquitto 위 작은 부하 테스트(`-check`) |
 
 ## 필요한 것
 
@@ -40,7 +208,7 @@ pixi shell
 call C:\pixi_ws\ros2-windows\local_setup.bat
 ```
 
-1. 관제 서버: `go run ./cmd/fleetd` (`-log debug`를 붙이면 버려진 오래된 메시지도 보인다. `-elevators <파일>`로 엘리베이터 설정, 없으면 기본 E1 하나, `-elevators none`이면 엘리베이터 없음)
+1. 관제 서버: `go run ./cmd/fleetd` (`-mqtt-id`로 MQTT 클라이언트 ID(기본 `fleetd`, 같은 브로커에 fleetd를 둘 띄우면 서로 다르게), `-log debug`를 붙이면 버려진 오래된 메시지도 보인다. `-elevators <파일>`로 엘리베이터 설정, 없으면 기본 E1 하나, `-elevators none`이면 엘리베이터 없음)
 2. mock 로봇: `python mock_robots\mock_fleet.py --count 3` (`--floor`/`--floors`로 시작 층)
 3. 어댑터: `python adapter\fleet_adapter.py`
 4. mock 엘리베이터(다른 층으로 가는 작업이 있을 때): `go run ./cmd/mockelevator` (fleetd에 `-elevators <파일>`을 줬으면 같은 파일을 준다)
@@ -66,7 +234,7 @@ mosquitto_pub -t fleet/robot_1/cmd -q 1 -m "{\"cmd_id\":\"c1\",\"type\":\"goto\"
 `goto`는 `accepted` 뒤에 `done` / `failed` / `cancelled`가 한 번 더 온다. 수행 중에는 로봇 상태의 `task_id`가 그 `cmd_id`다.
 같은 `cmd_id`를 다시 보내면 실행하지 않고 마지막 응답을 다시 보낸다.
 
-## 테스트
+## 테스트 실행
 
 ```bat
 go test ./...
@@ -74,6 +242,8 @@ cd C:\pixi_ws && pixi run python -m pytest C:\Users\han\Documents\fleet-lab\adap
 node scripts\web_test.js
 scripts\e2e.bat
 ```
+
+어댑터 pytest는 ROS 없이도 돈다(`test_adapter_wiring.py`가 rclpy·메시지 모듈을 가짜로 넣는다): 아무 Python 3.12에서 `python -m pip install pytest paho-mqtt` 뒤 `python -m pytest adapter`. CI도 이렇게 돌린다.
 
 `web_test.js`는 `web/app.js`의 DOM 없는 부분(위치 보간·외삽, 격자 선 수 제한, 이벤트 빈틈 채우기, 엘리베이터 칸·차 안 로봇·경보 계산)을 Node로 시험한다(패키지 필요 없음). 화면 그리기와 클릭은 자동 테스트가 없다.
 
@@ -87,6 +257,10 @@ scripts\e2e.bat
 어댑터의 탑승 절차는 `adapter/test_ride_logic.py`, 어댑터 배선(가짜 ROS·MQTT)은 `adapter/test_adapter_wiring.py`(pytest).
 테스트 목록과 리뷰는 [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
 
+부하 테스트(Mosquitto 필요, 기본 시나리오 5개 × 3번에 약 5분): `go build -o bin\fleetd.exe .\cmd\fleetd` 뒤 `go run .\cmd\loadtest -fleetd bin\fleetd.exe`. 문서의 나머지 두 표(3.5초 끊김, 브라우저 60개)는 LOAD_TEST.md의 명령으로. 옵션과 결과는 [docs/LOAD_TEST.md](docs/LOAD_TEST.md).
+fleetd의 `-bench-encode-per-client`, `-bench-block-slow`는 부하 테스트가 비교용으로만 켜는 숨은 스위치다(`-h`에 안 보임, 켜면 경고 로그). 운영에서는 쓰지 않는다.
+CI는 위의 Go·node·pytest를 돌리고(`go test`는 `-race`로), e2e는 ROS 2가 필요해 돌리지 않는다.
+
 ## API
 
 | 경로 | 내용 |
@@ -98,7 +272,7 @@ scripts\e2e.bat
 | `GET /events?since=<seq>` | `seq`보다 뒤의 보관 중인 이벤트. 첫 이벤트가 `seq+1`이 아니면 그 사이는 이미 버려졌다. 숫자가 아니면 `400` |
 | `GET /ws` | WebSocket 실시간 이벤트 |
 | `GET /ws/live` | WebSocket 위치 묶음 (아래 대시보드). 첫 메시지는 전체 스냅샷. 구독자는 64명까지, 넘으면 `503` |
-| `GET /live/stats` | 묶음 통계: `frames`, `heartbeats`, `encodes`, `encode_errors`, `unencodable`(NaN·Inf라 건너뛴 로봇), `dropped`(느린 브라우저에서 버린 묶음), `resyncs`(버린 뒤 보낸 스냅샷), `refused`(구독자 한도로 거절), `subscribers`, `seq` |
+| `GET /live/stats` | 묶음 통계: `frames`, `heartbeats`, `encodes`, `encode_errors`, `unencodable`(NaN·Inf라 건너뛴 로봇), `dropped`(느린 브라우저에서 버린 묶음), `resyncs`(버린 뒤 보낸 스냅샷), `refused`(구독자 한도로 거절), `subscribers`, `seq`. 벤치 모드(`-bench-block-slow`)에서만 `blocked`, `blocked_ms` |
 | `GET /` | 대시보드 (`index.html`, `app.js`, `style.css`) |
 | `POST /tasks` | 작업 추가. 본문 `{"waypoints":[{"x":1,"y":2,"floor":1}]}` (x, y, floor 모두 필수, |x|·|y| ≤ 1,000,000 m, 뒤에 다른 데이터 없음) → `201` + 작업. 형식이 틀리거나 범위 밖이면 `400`, 1 MB 넘으면 `413`, 저장 실패면 `500`(작업은 만들어지지 않음) |
 | `GET /tasks?state=QUEUED` | 작업 목록 (만든 순서). `state`는 선택, 모르는 값이면 `400` |

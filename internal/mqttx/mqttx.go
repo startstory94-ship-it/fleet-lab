@@ -41,6 +41,9 @@ func (c *Client) Connected() <-chan struct{} { return c.conns }
 
 // Backoff returns the wait before reconnect attempt n: exponential from 1 s,
 // capped at 30 s, with ±50% jitter so many clients don't retry in lockstep.
+// autopaho calls it with n = 0 before the first attempt of every (re)connect
+// too, so even the first connection at start-up waits 0.5-1.5 s.
+// docs/LOAD_TEST.md measures it against the same backoff without jitter.
 func Backoff(n int) time.Duration {
 	base := time.Second << min(n, 5) // 1, 2, 4, 8, 16, 32 s
 	base = min(base, 30*time.Second)

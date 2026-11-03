@@ -23,7 +23,9 @@
 // Locks: the broadcaster's mutex is a leaf. Tick reads the robot source
 // (registry lock) and the charge source (task manager lock) one after the
 // other, holding no other lock, and only then takes its own mutex; under it,
-// it only does non-blocking channel operations. Nothing calls into the
+// it only does non-blocking channel operations (the benchmark-only
+// Config.BlockOnSlow breaks this on purpose, bounded by BlockTimeout; a
+// subscriber's reader never needs the mutex, so it still drains). Nothing calls into the
 // broadcaster while holding another lock. With the existing order (task
 // manager -> registry -> event numbering -> event hub -> hub subscriber) the
 // lock graph stays acyclic; see README.
@@ -131,6 +133,21 @@ type Config struct {
 	Buffer         int           // frames queued per subscriber
 	MaxSubscribers int           // Subscribe fails beyond this
 	Log            *slog.Logger  // optional
+
+	// BENCHMARK ONLY. These switch to the designs this package avoids, so
+	// cmd/loadtest can measure the difference against the real server
+	// (fleetd -bench-encode-per-client / -bench-block-slow). Leave them off.
+	//
+	// EncodePerClient encodes every delta and heartbeat once per subscriber
+	// instead of once per tick (snapshots stay shared).
+	EncodePerClient bool
+	// BlockOnSlow makes Tick wait, holding the broadcaster's mutex, until a
+	// full subscriber queue has room, instead of dropping its old frames and
+	// queueing a snapshot. The wait is capped at BlockTimeout (default 5 s,
+	// the WebSocket write timeout), after which it falls back to the
+	// drop-and-resync path so a dead client cannot wedge the server forever.
+	BlockOnSlow  bool
+	BlockTimeout time.Duration
 }
 
 func DefaultConfig() Config {
@@ -237,8 +254,12 @@ type Stats struct {
 	Dropped      uint64 `json:"dropped"`       // frames dropped from full subscriber queues
 	Resyncs      uint64 `json:"resyncs"`       // snapshots queued after drops
 	Refused      uint64 `json:"refused"`       // subscribers refused at MaxSubscribers
-	Subscribers  int    `json:"subscribers"`
-	Seq          uint64 `json:"seq"`
+	// Only with Config.BlockOnSlow (benchmark): sends that had to wait for a
+	// full queue, and the total time Tick spent waiting.
+	Blocked     uint64 `json:"blocked,omitempty"`
+	BlockedMS   uint64 `json:"blocked_ms,omitempty"`
+	Subscribers int    `json:"subscribers"`
+	Seq         uint64 `json:"seq"`
 }
 
 // Broadcaster is safe for concurrent use.
@@ -273,6 +294,9 @@ func New(cfg Config, robots RobotSource, charge ChargeSource) *Broadcaster {
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if cfg.BlockTimeout <= 0 {
+		cfg.BlockTimeout = 5 * time.Second
 	}
 	return &Broadcaster{cfg: cfg, robots: robots, charge: charge, now: time.Now,
 		subs: make(map[*Sub]struct{}), prev: make(map[string]RobotView)}
@@ -411,23 +435,54 @@ func (b *Broadcaster) Tick() {
 	}
 	sort.Slice(changed, func(i, j int) bool { return changed[i].Name < changed[j].Name })
 	sort.Strings(removed)
-	data, ok := b.encode(Frame{Type: Delta, Seq: b.seq + 1, Time: now, Robots: changed, Removed: removed})
+	frame := Frame{Type: Delta, Seq: b.seq + 1, Time: now, Robots: changed, Removed: removed}
+	data, ok := b.encode(frame)
 	if !ok {
 		return // nothing committed: the change is still a change next tick
 	}
 	b.prev, b.seq, b.time, b.lastSent = cur, b.seq+1, now, now
 	b.stats.Frames++
 	q := queued{data: data, seq: b.seq, kind: Delta}
+	first := true
 	for s := range b.subs {
 		if s.needSnap {
 			continue // a snapshot (which includes this change) is owed
 		}
+		qs := q
+		if b.cfg.EncodePerClient && !first { // benchmark only
+			if qs.data, ok = b.encode(frame); !ok {
+				s.needSnap = true // it misses this delta: resync on the next tick
+				continue
+			}
+		}
+		first = false
+		b.deliver(s, qs)
+	}
+}
+
+// deliver queues q for s. When the queue is full the old frames are dropped
+// and a snapshot is queued instead (resync); with the benchmark-only
+// BlockOnSlow it waits for room first. Call with b.mu held.
+func (b *Broadcaster) deliver(s *Sub, q queued) {
+	select {
+	case s.c <- q:
+		return
+	default:
+	}
+	if b.cfg.BlockOnSlow {
+		start := time.Now()
+		t := time.NewTimer(b.cfg.BlockTimeout)
+		defer t.Stop()
+		b.stats.Blocked++
 		select {
 		case s.c <- q:
-		default:
-			b.resync(s)
+			b.stats.BlockedMS += uint64(time.Since(start).Milliseconds())
+			return
+		case <-t.C:
+			b.stats.BlockedMS += uint64(time.Since(start).Milliseconds())
 		}
 	}
+	b.resync(s)
 }
 
 // heartbeat sends a heartbeat if nothing was sent for cfg.Heartbeat. A
@@ -444,7 +499,14 @@ func (b *Broadcaster) heartbeat(now time.Time) {
 	b.lastSent = now
 	b.stats.Heartbeats++
 	q := queued{data: data, seq: b.seq, kind: Heartbeat}
+	first := true
 	for s := range b.subs {
+		if b.cfg.EncodePerClient && !first { // benchmark only
+			if q.data, ok = b.encode(Frame{Type: Heartbeat, Seq: b.seq, Time: now}); !ok {
+				continue
+			}
+		}
+		first = false
 		select {
 		case s.c <- q:
 		default:

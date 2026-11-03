@@ -392,3 +392,27 @@ func TestElevators(t *testing.T) {
 		t.Fatalf("waiting %v, want []", e["waiting"])
 	}
 }
+
+// The /ws/live send buffer can only be shrunk when the server keeps the
+// connection in the request context (fleetd sets ConnContext).
+func TestLimitSendBufferNeedsConnContext(t *testing.T) {
+	for _, withCtx := range []bool{true, false} {
+		got := make(chan bool, 1)
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got <- limitSendBuffer(r)
+		}))
+		if withCtx {
+			srv.Config.ConnContext = ConnContext
+		}
+		srv.Start()
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		srv.Close()
+		if applied := <-got; applied != withCtx {
+			t.Errorf("ConnContext set %v: limitSendBuffer = %v", withCtx, applied)
+		}
+	}
+}

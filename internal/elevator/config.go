@@ -58,8 +58,9 @@ type Timing struct {
 	// Silence: no state from the car for this long means it is not
 	// responding (it publishes every second).
 	Silence time.Duration
-	// TurnTimeout: the next robot moves if the one before has not reported
-	// zone_clear (or failed) by then.
+	// TurnTimeout: a turn with no zone clear/failed by then is closed and
+	// counts as a failed try of the same robot (retry, then carry or stuck).
+	// It never lets the next robot move: that needs door_zone 0 (see Car).
 	TurnTimeout time.Duration
 	// ExitRetries: a robot that reports exit_failed gets this many more
 	// turns at the same stop before it is carried to the next one.

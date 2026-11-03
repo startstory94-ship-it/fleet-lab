@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -33,6 +34,12 @@ type config struct {
 	logLevel string
 	frame    time.Duration
 	lifts    string
+	mqttID   string
+
+	// Benchmark-only switches for cmd/loadtest (see live.Config). Hidden from
+	// -h; production runs leave them off.
+	benchPerClient bool
+	benchBlockSlow bool
 }
 
 func parseFlags() config {
@@ -43,6 +50,21 @@ func parseFlags() config {
 	flag.StringVar(&c.logLevel, "log", "info", "log level: debug, info, warn, error")
 	flag.DurationVar(&c.frame, "frame", live.DefaultConfig().FrameInterval, "dashboard frame interval (/ws/live)")
 	flag.StringVar(&c.lifts, "elevators", "", `elevator config JSON file; "" = one default car E1 (floors 1-10, lobby (10,0)), "none" = no elevators`)
+	flag.StringVar(&c.mqttID, "mqtt-id", "fleetd", "MQTT client id (unique per broker; a second fleetd with the same id kicks the first off)")
+	flag.BoolVar(&c.benchPerClient, "bench-encode-per-client", false, "BENCHMARK ONLY: encode /ws/live frames once per client instead of once")
+	flag.BoolVar(&c.benchBlockSlow, "bench-block-slow", false, "BENCHMARK ONLY: wait for slow /ws/live clients instead of dropping their old frames")
+	flag.Usage = func() {
+		// The standard listing, minus the benchmark switches (see cmd/loadtest).
+		shown := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+		shown.SetOutput(flag.CommandLine.Output())
+		flag.VisitAll(func(f *flag.Flag) {
+			if !strings.HasPrefix(f.Name, "bench-") {
+				shown.Var(f.Value, f.Name, f.Usage)
+			}
+		})
+		fmt.Fprintf(shown.Output(), "Usage of %s:\n", os.Args[0])
+		shown.PrintDefaults()
+	}
 	flag.Parse()
 	return c
 }
@@ -134,7 +156,7 @@ func main() {
 	}()
 
 	ingest := fleet.Ingest(registry, log)
-	mq, err := mqttx.Connect(ctx, log, cfg.mqttURL, "fleetd", []mqttx.Subscription{
+	mq, err := mqttx.Connect(ctx, log, cfg.mqttURL, cfg.mqttID, []mqttx.Subscription{
 		{Topic: fleet.TopicPose, QoS: 0},
 		{Topic: fleet.TopicState, QoS: 1},
 		{Topic: fleet.TopicAdapterStatus, QoS: 1},
@@ -198,10 +220,15 @@ func main() {
 	liveCfg := live.DefaultConfig()
 	liveCfg.FrameInterval = cfg.frame
 	liveCfg.Log = log
+	liveCfg.EncodePerClient, liveCfg.BlockOnSlow = cfg.benchPerClient, cfg.benchBlockSlow
+	if cfg.benchPerClient || cfg.benchBlockSlow {
+		log.Warn("BENCHMARK MODE: /ws/live runs a design fleetd avoids; for cmd/loadtest only",
+			"encode_per_client", cfg.benchPerClient, "block_on_slow", cfg.benchBlockSlow)
+	}
 	frames := live.New(liveCfg, registry, tasks)
 	go frames.Run(ctx)
 
-	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, tasks, frames, log), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, tasks, frames, log), ReadHeaderTimeout: 5 * time.Second, ConnContext: api.ConnContext}
 
 	go func() {
 		log.Info("http listening", "addr", cfg.httpAddr)
