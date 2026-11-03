@@ -39,16 +39,21 @@ func Ingest(g *Registry, log *slog.Logger) func(topic string, payload []byte) {
 		switch kind {
 		case "pose":
 			var m PoseMsg
-			if err = json.Unmarshal(payload, &m); err == nil && !g.ApplyPose(name, m) {
-				log.Debug("stale pose dropped", "robot", name, "boot", m.Boot, "seq", m.Seq)
+			if err = json.Unmarshal(payload, &m); err == nil {
+				if err = m.Check(); err == nil && !g.ApplyPose(name, m) {
+					log.Debug("stale pose dropped", "robot", name, "boot", m.Boot, "seq", m.Seq)
+				}
 			}
 		case "state":
 			var m StateMsg
-			if err = json.Unmarshal(payload, &m); err == nil && !g.ApplyState(name, m) {
-				log.Debug("stale state dropped", "robot", name, "boot", m.Boot, "seq", m.Seq)
+			if err = json.Unmarshal(payload, &m); err == nil {
+				if err = m.Check(); err == nil && !g.ApplyState(name, m) {
+					log.Debug("stale state dropped", "robot", name, "boot", m.Boot, "seq", m.Seq)
+				}
 			}
 		}
 		if err != nil {
+			g.rejected.Add(1)
 			log.Warn("bad message", "topic", topic, "err", err)
 		}
 	}

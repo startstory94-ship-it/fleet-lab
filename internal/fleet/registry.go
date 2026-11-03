@@ -4,6 +4,7 @@ package fleet
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -111,7 +112,12 @@ type Registry struct {
 	now    func() time.Time
 	emit   func(Event)
 	evSeq  uint64
+
+	rejected atomic.Uint64 // messages Ingest could not parse or Check refused
 }
+
+// Rejected counts messages refused by Ingest (bad JSON or values out of range).
+func (g *Registry) Rejected() uint64 { return g.rejected.Load() }
 
 // NewRegistry creates a registry. emit is called with the registry lock held,
 // so events reach it in the order the changes happened; it must not block or

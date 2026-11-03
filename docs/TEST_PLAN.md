@@ -139,15 +139,49 @@
 | 테스트 | sim 통합 테스트가 위험 수준에 닿지 않음 | 지연 + 긴 작업으로 돌려주기가 일어나는 sim 실행 추가 | `TestCriticalBatteryHandsTasksBack` |
 | e2e | 불안정 요인: 이벤트 목록을 정확히 비교, 32%−8% ≈ 24%로 여유 1%, 다른 로봇 위치에 따라 `bat_1`이 가장 가깝지 않을 수 있음, 최근 200개 안에 이벤트가 다 있어야 함 | 처음 나온 순서만 비교(재전송 허용), 30%·3%/m(≈18%), `bat_1` 도크를 (25,0)으로(앞 시나리오는 x ≤ 8), `GET /events?since=`로 이벤트를 빠짐없이 모으고 빠지면 실패 | `scripts/e2e.py`, `TestEventsSince` |
 
-## 5단계: 대시보드 (계획)
+## 5단계: 대시보드
 
 | 테스트 | 상태 | 리뷰 |
 |---|---|---|
-| 묶음에 바뀐 로봇만 포함 | ⬜ | 좋음 |
-| 느린 브라우저는 오래된 묶음 버림 | ⬜ | 2단계 이벤트 허브 테스트와 같은 방식 |
-| 🔧 묶음은 한 번만 만들어 모든 브라우저에 같은 바이트 전송 | 🔧 | 부하 테스트 비교 항목이라 단위 테스트로도 고정 |
-| 화면 보간 | ⬜ | Go로는 시험 불가. 수동 확인 + 데모 GIF |
+| 묶음에 바뀐 로봇만 포함 | ✅ `TestDeltaHasOnlyChangedRobots` | 표시 필드(연결, 작업, 배터리, 층, 방향, 오류)를 하나씩 바꿔 그 로봇만 나오는지, 1 mm 미만 변화와 변화 없음은 묶음 없음, 사라진 로봇은 `removed` |
+| 새 구독자의 첫 묶음은 전체 스냅샷, 이어지는 delta와 seq가 맞음 | ✅ `TestFirstFrameIsSnapshot`, `TestLiveFirstMessageIsSnapshot`(httptest + coder/websocket) | 스냅샷 + delta를 적용한 결과가 실제 상태와 같은지 비교 |
+| seq는 1씩, 시각은 서버 시계 | ✅ `TestFrameSeqAndTime` | 가짜 시계, 수동 Tick |
+| 묶음은 한 번만 만들어 모든 브라우저에 같은 바이트 전송 | ✅ `TestEncodeOncePerFrame` | 구독자 20명: Tick마다 인코딩 1번(`Stats.Encodes`), 받은 슬라이스가 같은 메모리(`&data[0]`). 스냅샷도 seq마다 한 번만 만들어 공유 |
+| 느린 브라우저는 오래된 묶음을 버리고 스냅샷으로 다시 맞춤, 빠른 브라우저는 모두 받음 | ✅ `TestSlowSubscriberResyncs`, `TestPartialReaderNeverSeesGap` | 대기열 4, Tick 10번: 느린 쪽은 버림 8·스냅샷 2, 이후 읽는 순서 snapshot·delta·delta, 최종 상태 일치. 빠른 쪽은 delta 10개를 빈틈없이. 띄엄띄엄 읽는 쪽도 200 Tick 동안 빈틈 없음 |
+| 동시에 Tick·구독·해지 | ✅ `TestConcurrentSubscribers` | 아래 리뷰 1을 잡은 테스트. 교착 없음, 읽는 쪽 8개가 빈틈 있는 delta를 한 번도 받지 않음, 실제로 버림이 일어났는지도 확인 |
+| 구독 해지 뒤 전달 안 됨 | ✅ `TestUnsubscribeStopsDelivery` | 두 번 해지해도 됨 |
+| 충전 필요 표시가 나타나고 사라짐 | ✅ `TestNeedsChargeAppearsAndClears`(live), `TestNeedsChargeExposesFlag`(task, 24→60→89.9→90% 히스테리시스) | |
+| `GET /`와 `.js`·`.css` 콘텐츠 타입, 없는 파일 404 | ✅ `TestDashboardServed` | Windows 레지스트리가 `.js`를 `text/plain`으로 바꿀 수 있어 확장자별로 직접 지정 |
+| 테스트가 실제로 잡는지 | ✅ 수동 확인 | 변이: ① 빈틈 delta 걸러내기 제거 → `TestConcurrentSubscribers` 실패 ② 버린 뒤 스냅샷 대신 delta → `TestSlowSubscriberResyncs`·`TestPartialReader…` 실패 ③ 새 묶음을 버림(옛것 유지) → 세 테스트 실패 |
+| 실제 환경 | ✅ `scripts/e2e.py` 12번 (시나리오 4개 추가, 모두 35개) | `GET /` 200 HTML, `/ws/live` 첫 묶음이 모든 로봇의 스냅샷, 작업을 받은 로봇의 x/y가 묶음마다 바뀜(5초에 24번), 간격 중앙값 150 ms, seq 빈틈 없음. pixi 환경에 WebSocket 라이브러리가 없어 스크립트 안에 최소 RFC 6455 클라이언트를 넣음. 두 번 연속 35/35 |
+| 대시보드 JS (DOM 없는 부분) | ✅ `node scripts/web_test.js` (23개) | `poseAt` 보간·±π 회전·같은 시각 두 점·외삽(250 ms 상한, 멈춤·IDLE은 안 함), `gridLines` 200줄 상한·1e17 근처 부동소수·NaN, `inRange`, `EventFeed` 빈틈 채우기·채우는 중 도착·중복·서버가 지운 것 건너뛰기·첫 로드·실패 후 재시도·재시작(번호 감소, 실행 ID 변경) |
+| 화면 그리기·클릭 | ⬜ 자동 테스트 없음 | `demo.bat` + 앱 안 브라우저로 확인(아래 5단계 리뷰). 데모 GIF는 7단계 |
 
+### 5단계 구현 중 찾은 문제 (수정함)
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 높음 | 처음 설계("가득 차면 대기열을 비우고 스냅샷")에서, 전송 쪽이 가장 오래된 묶음을 꺼내 버리는 순간 읽는 쪽이 그다음 묶음을 꺼내 가면 빈틈 위에 delta를 적용한다 | 대기열 항목에 seq와 종류를 붙이고, 읽는 쪽(`Sub.Next`)이 앞 묶음에 이어지지 않는 delta를 버린다. 비운 뒤에는 바로 스냅샷이 들어가 있다 | `TestConcurrentSubscribers` (수정 전 8개 읽는 쪽 모두 "gap") |
+
+### 5단계 리뷰 (2026-11-03, 모두 수정함)
+
+리뷰어 증명: `TestReviewHugePoseNoPanic`(그대로 옮김, 수정 전 패닉), Node 하네스(이벤트 5개 중 3개만 보임, 먼 지점 하나로 `render` 무한 반복).
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 높음 | 위치 x=1e306 → `round()`가 Inf → `json.Marshal` 실패 → `Run` 고루틴에서 패닉 → fleetd 종료 | ① `Ingest`가 `PoseMsg.Check`/`StateMsg.Check`로 거름: 위치 NaN·Inf·\|x\|,\|y\|>1e6 m, yaw NaN·Inf, \|v\|>100 m/s, 배터리 0~100 밖, `silence_s` 0~3600 밖 → 메시지 통째로 버림, 로그 + `Registry.Rejected()`, 마지막 정상 값 유지 ② `round`가 넘치면 원래 값 ③ NaN·Inf가 남은 로봇은 그 로봇만 이전 값으로 두고 건너뜀(`unencodable`) ④ 인코딩 실패는 기록(1·2·4…번째만)하고 묶음을 건너뜀, 상태는 그대로라 다음 묶음에 나감 | `TestReviewHugePoseNoPanic`, `TestIngestRejectsOutOfRange`(경계값 통과 포함), `TestNonFiniteRobotSkipped` |
+| 2 높음 | 먼 점 하나(1e17)로 격자 반복이 끝나지 않음(부동소수에서 `x += step`이 그대로), 1e5 m면 프레임마다 3만 줄 | `gridLines`: 축마다 200줄 이하가 되도록 간격을 1·5·10·50…으로 늘리고, 정수 번호 k로 세어 반복 횟수를 제한. \|x\|,\|y\|>1e6 점은 화면 범위에서 뺌. `task.Submit`이 범위 밖 지점을 `ErrInvalid`(API `400`) | `gridLines` 4개(node), `TestSubmitValidation`(범위), `TestPostTask`(1e17 → 400) |
+| 3 중 | 이벤트 빈틈을 채우기 전에 `eventSeq`를 올려 채운 결과를 버림(재연결 때도) | `EventFeed`: 이어지지 않는 이벤트는 붙잡아 두고, `since=마지막으로 보인 번호`로 받아 합쳐 순서대로. 채우는 중 도착한 것은 한 번 더 받음. 서버 창 밖으로 밀려난 것만 건너뛰고 알림 | `EventFeed` 6개(node) |
+| 3 추가 | 브라우저 확인 중 발견: fleetd 재시작 직후 `/events?n=1`이 `null`을 돌려줘(빈 보관함의 nil 슬라이스) 재연결 처리가 예외로 끝나고, 새 서버의 1번부터 이벤트를 영영 무시 | `Hub.Recent`가 빈 목록 `[]`. 모든 응답에 서버 실행 ID `X-Fleetd-Boot`, 바뀌면 이벤트를 처음부터(번호만 보고는 새 서버가 몇 초 만에 옛 번호를 넘어서 못 잡음) | `TestEventsLimit`(빈 목록이 `[]`, 되돌리면 실패 확인), `TestBootHeader`, `EventFeed` 재시작 2개(node) |
+| 4 중하 | 멈춘 연결이 "연결됨"으로 남음 | 2초 동안 바뀐 것이 없으면 `heartbeat` 묶음(현재 `seq` 그대로, 빈틈 없음; 대기열이 찬 구독자는 건너뜀). `Next`는 마지막으로 돌려준 `seq`와 같은 heartbeat만 넘김. 브라우저는 위치 연결에서 5초 동안 아무것도 없으면 "응답 없음" 후 재연결 | `TestHeartbeat`, `TestStaleHeartbeatDiscarded`, e2e 묶음 순서 검사(heartbeat는 같은 `seq`) |
+| 5 낮음 | 끊김(200 ms 지연이 묶음 간격에 가까움) | 지연 350 ms + 최신 위치를 지나면 이동 중일 때만 v·yaw로 최대 250 ms 외삽. 위치가 같아도 속도·모드가 바뀌면 새 표본(멈춤이 외삽을 끝냄) | `poseAt` 5개(node) |
+| 6 낮음 | 다른 사이트가 단순 POST로 작업 생성·취소 가능 | 두 POST: `application/json` 필수(`415`), `Sec-Fetch-Site: cross-site/same-site`·다른 `Origin`은 `403`. 클릭 한 번 작업은 유지하고 3초 "취소" 알림(되돌리기) | `TestPostsRefuseOtherSites`(두 경로 × 7가지 + 같은 출처 201/200) |
+| 7 낮음 | e2e WebSocket 클라이언트가 프레임 중간 시간 초과에 헤더를 잃음 | 프레임 전체가 버퍼에 올 때까지 소비하지 않고, 조각난 메시지도 호출 사이에 보관 | 가짜 소켓으로 헤더·길이·본문·조각을 시간 초과 사이에 나눠 보내 확인(일회성 스크립트) |
+| 변이 | 살아남던 변이: 스냅샷 `Time` 빠짐, `Run`이 `Tick`을 안 부름, `/ws/live` 쓰기 시간 제한 없음, 구독 해지 안 함, `NeedsCharge`가 판단 전 로봇 무시 | 각각 잡는 테스트 추가. 구독자 한도(64, 넘으면 `503`)와 `frames == nil`의 `503` 테스트도 추가 | `TestSnapshotCarriesFrameTime`, `TestRunTicks`, `TestLiveSlowClientClosed`(안 읽는 클라이언트는 닫히고 읽는 쪽은 계속 받음), `TestLiveSubscriberLimit`(닫으면 `Subscribers` 0으로), `TestNeedsChargeBeforeFirstTick`, `TestMaxSubscribers`, `TestLiveOffIs503`. 각 변이를 실제로 넣어 실패 확인 |
+
+브라우저 확인(`demo.bat`, 앱 안 브라우저): 클릭 → 3초 알림 → "취소" → `CANCELLED`; 2층 작업을 만들면 층 버튼에 2층이 생기고 누르면 그 층 지점만 보임; 작업 목록 "취소"로 수행 중 작업 취소(로봇 멈춤);
+`drop_comms`를 8초마다 보내 robot_2를 STALE(흐린 점선 원) → OFFLINE(어두운 원에 X) → 복구; fleetd를 끄면 "연결 끊김" 띠와 두 배지 "끊김", 다시 켜면 띠가 사라지고 "서버가 다시 시작됨" 알림 뒤 새 서버의 이벤트가 처음부터 보임.
+확인하지 못한 것: 연결은 살아 있는데 서버가 멈춘 경우의 "응답 없음"(서버를 죽이면 소켓이 바로 닫혀서 재현 못 함, heartbeat 쪽은 Go 테스트로만), IN_ELEVATOR 그리기(6단계 전이라 mock이 보내지 않음).
 ## 6단계: 목적층이 다른 로봇 함께 태우기 (계획) ⭐
 
 | 테스트 | 상태 | 리뷰 |

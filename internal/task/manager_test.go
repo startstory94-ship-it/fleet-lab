@@ -517,6 +517,14 @@ func TestSubmitValidation(t *testing.T) {
 	if _, err := h.m.Submit([]Waypoint{{X: inf}}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("infinite x: %v", err)
 	}
+	for _, w := range []Waypoint{{X: 1e17}, {Y: -1e6 - 1}, {X: 2e6, Y: 2e6}} {
+		if _, err := h.m.Submit([]Waypoint{{X: 1, Y: 1}, w}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("waypoint %+v out of range accepted: %v", w, err)
+		}
+	}
+	if _, err := h.m.Submit([]Waypoint{{X: 1e6, Y: -1e6}}); err != nil {
+		t.Fatalf("waypoint at the limit refused: %v", err)
+	}
 }
 
 func TestEventsAndPersistence(t *testing.T) {

@@ -88,5 +88,5 @@ func (h *Hub) Recent(n int) []fleet.Event {
 	if n <= 0 || n > len(h.history) {
 		n = len(h.history)
 	}
-	return append([]fleet.Event(nil), h.history[len(h.history)-n:]...)
+	return append([]fleet.Event{}, h.history[len(h.history)-n:]...) // [] not null in JSON
 }

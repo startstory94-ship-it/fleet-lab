@@ -17,6 +17,7 @@ import (
 	"fleetlab/internal/api"
 	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
+	"fleetlab/internal/live"
 	"fleetlab/internal/mqttx"
 	"fleetlab/internal/store"
 	"fleetlab/internal/task"
@@ -29,6 +30,7 @@ type config struct {
 	mqttURL  string
 	dbPath   string
 	logLevel string
+	frame    time.Duration
 }
 
 func parseFlags() config {
@@ -37,6 +39,7 @@ func parseFlags() config {
 	flag.StringVar(&c.mqttURL, "mqtt", "mqtt://127.0.0.1:1883", "MQTT broker URL")
 	flag.StringVar(&c.dbPath, "db", "fleetd.db", "SQLite database path")
 	flag.StringVar(&c.logLevel, "log", "info", "log level: debug, info, warn, error")
+	flag.DurationVar(&c.frame, "frame", live.DefaultConfig().FrameInterval, "dashboard frame interval (/ws/live)")
 	flag.Parse()
 	return c
 }
@@ -149,7 +152,16 @@ func main() {
 		}
 	}()
 
-	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, tasks, log), ReadHeaderTimeout: 5 * time.Second}
+	// Dashboard frames. The broadcaster reads the registry and the manager's
+	// needs-charge flags one at a time and holds no lock while doing so; see
+	// internal/live for the lock order.
+	liveCfg := live.DefaultConfig()
+	liveCfg.FrameInterval = cfg.frame
+	liveCfg.Log = log
+	frames := live.New(liveCfg, registry, tasks)
+	go frames.Run(ctx)
+
+	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, tasks, frames, log), ReadHeaderTimeout: 5 * time.Second}
 
 	go func() {
 		log.Info("http listening", "addr", cfg.httpAddr)

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fleetd 관제</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>fleetd 관제</h1>
+  <span class="conn" id="conn-live" title="/ws/live">위치 연결 중…</span>
+  <span class="conn" id="conn-events" title="/ws">이벤트 연결 중…</span>
+  <span class="count" id="count-robots">로봇 0대</span>
+  <span class="count" id="count-tasks">작업 0개</span>
+</header>
+<div id="banner" hidden>연결 끊김 — 다시 연결하는 중…</div>
+<main>
+  <section id="map-panel">
+    <div class="toolbar">
+      <span>층</span>
+      <span id="floors"></span>
+      <span class="sep"></span>
+      <span id="draft-info">지도를 클릭하면 그 지점으로 작업을 보냅니다(3초 안에 취소 가능). Shift+클릭으로 여러 지점을 모읍니다.</span>
+      <button id="draft-send" hidden>작업 보내기</button>
+      <button id="draft-clear" hidden>지우기</button>
+    </div>
+    <canvas id="map"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--idle)"></i>대기</span>
+      <span><i style="background:var(--moving)"></i>이동</span>
+      <span><i style="background:var(--charging)"></i>도킹·충전</span>
+      <span><i style="background:var(--error)"></i>오류</span>
+      <span><i style="background:var(--elevator)"></i>엘리베이터</span>
+      <span><i class="stale"></i>끊김(STALE)</span>
+      <span><i style="background:var(--offline)"></i>오프라인</span>
+      <span id="cursor"></span>
+    </div>
+  </section>
+  <section id="side">
+    <h2>로봇</h2>
+    <table id="robots">
+      <thead><tr><th>이름</th><th>상태</th><th>배터리</th><th>작업</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h2>작업</h2>
+    <table id="tasks">
+      <thead><tr><th>ID</th><th>상태</th><th>로봇</th><th>구간</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <h2>이벤트</h2>
+    <ol id="events"></ol>
+  </section>
+</main>
+<div id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

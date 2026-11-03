@@ -14,11 +14,13 @@ ROS 2 mock 로봇과 Go 관제 서버(fleetd)로 만드는 로봇 플릿 관제 
 | `internal/task` | 작업 배정·명령 재전송·재배정·취소, 배터리 정책(`battery.go`) (가짜 시계로 테스트) |
 | `internal/store` | 작업을 SQLite에 저장 (modernc.org/sqlite, cgo 없음) |
 | `internal/sim` | 통합 테스트용 가짜 로봇 (MQTT·ROS 없이 실제 Registry와 Manager에 연결, 배터리·도킹 포함) |
-| `internal/api` | REST API |
+| `internal/api` | REST API, WebSocket(`/ws` 이벤트, `/ws/live` 위치 묶음), 대시보드 파일 제공 |
+| `internal/live` | 대시보드용 위치 묶음: 바뀐 로봇만 0.15초마다 한 번 만들어 모든 브라우저에 같은 바이트로, 느린 브라우저는 오래된 묶음을 버리고 전체 스냅샷으로 다시 맞춤 |
+| `web/` | 대시보드 (HTML·CSS·JS 하나씩, 빌드 없음, 외부 CDN 없음, `go:embed`로 fleetd에 들어감) |
 | `mock_robots/` | ROS 2 mock 로봇 (Gazebo 없음) |
 | `adapter/` | ROS 2 ↔ MQTT 어댑터 |
 | `docs/` | 테스트 계획과 리뷰 기록 |
-| `scripts/` | 끝단 시나리오 테스트 (`e2e.bat`) |
+| `scripts/` | 끝단 시나리오 테스트 (`e2e.bat`), 대시보드 JS 테스트 (`web_test.js`), 데모 실행 (`demo.bat`) |
 
 ## 필요한 것
 
@@ -39,6 +41,8 @@ call C:\pixi_ws\ros2-windows\local_setup.bat
 1. 관제 서버: `go run ./cmd/fleetd` (`-log debug`를 붙이면 버려진 오래된 메시지도 보인다)
 2. mock 로봇: `python mock_robots\mock_fleet.py --count 3`
 3. 어댑터: `python adapter\fleet_adapter.py`
+
+브라우저에서 http://127.0.0.1:8080/ 을 열면 대시보드가 보인다. 한 번에 띄우려면 `scripts\demo.bat`(서버·mock 로봇 3대(`--roam-rate 2`)·어댑터를 각각 창으로 띄움, Mosquitto 필요).
 
 확인:
 
@@ -62,11 +66,14 @@ mosquitto_pub -t fleet/robot_1/cmd -q 1 -m "{\"cmd_id\":\"c1\",\"type\":\"goto\"
 ```bat
 go test ./...
 cd C:\pixi_ws && pixi run python -m pytest C:\Users\han\Documents\fleet-lab\adapter
+node scripts\web_test.js
 scripts\e2e.bat
 ```
 
-`e2e.bat`은 서버·mock 로봇·어댑터를 실제로 띄워 시나리오 31개를 돌린다(약 1분 40초, Mosquitto 필요).
-작업 배정, 서버 재시작 후 작업 이어가기, 배터리 정책(배터리가 낮은 로봇 `bat_1`을 따로 띄움)도 여기서 확인한다.
+`web_test.js`는 `web/app.js`의 DOM 없는 부분(위치 보간·외삽, 격자 선 수 제한, 이벤트 빈틈 채우기)을 Node로 시험한다(패키지 필요 없음). 화면 그리기와 클릭은 자동 테스트가 없다.
+
+`e2e.bat`은 서버·mock 로봇·어댑터를 실제로 띄워 시나리오 35개를 돌린다(약 2분, Mosquitto 필요).
+작업 배정, 서버 재시작 후 작업 이어가기, 배터리 정책(배터리가 낮은 로봇 `bat_1`을 따로 띄움), 대시보드와 `/ws/live`도 여기서 확인한다.
 테스트 목록과 리뷰는 [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
 
 ## API
@@ -77,10 +84,19 @@ scripts\e2e.bat
 | `GET /events?n=50` | 최근 이벤트 (최대 200개) |
 | `GET /events?since=<seq>` | `seq`보다 뒤의 보관 중인 이벤트. 첫 이벤트가 `seq+1`이 아니면 그 사이는 이미 버려졌다. 숫자가 아니면 `400` |
 | `GET /ws` | WebSocket 실시간 이벤트 |
-| `POST /tasks` | 작업 추가. 본문 `{"waypoints":[{"x":1,"y":2,"floor":1}]}` (x, y, floor 모두 필수, 뒤에 다른 데이터 없음) → `201` + 작업. 형식이 틀리면 `400`, 1 MB 넘으면 `413`, 저장 실패면 `500`(작업은 만들어지지 않음) |
+| `GET /ws/live` | WebSocket 위치 묶음 (아래 대시보드). 첫 메시지는 전체 스냅샷. 구독자는 64명까지, 넘으면 `503` |
+| `GET /live/stats` | 묶음 통계: `frames`, `heartbeats`, `encodes`, `encode_errors`, `unencodable`(NaN·Inf라 건너뛴 로봇), `dropped`(느린 브라우저에서 버린 묶음), `resyncs`(버린 뒤 보낸 스냅샷), `refused`(구독자 한도로 거절), `subscribers`, `seq` |
+| `GET /` | 대시보드 (`index.html`, `app.js`, `style.css`) |
+| `POST /tasks` | 작업 추가. 본문 `{"waypoints":[{"x":1,"y":2,"floor":1}]}` (x, y, floor 모두 필수, |x|·|y| ≤ 1,000,000 m, 뒤에 다른 데이터 없음) → `201` + 작업. 형식이 틀리거나 범위 밖이면 `400`, 1 MB 넘으면 `413`, 저장 실패면 `500`(작업은 만들어지지 않음) |
 | `GET /tasks?state=QUEUED` | 작업 목록 (만든 순서). `state`는 선택, 모르는 값이면 `400` |
 | `GET /tasks/{id}` | 작업 하나. 없으면 `404` |
 | `POST /tasks/{id}/cancel` | 취소. 로봇이 하던 중이면 `cancel` 명령을 보낸다. 이미 끝난 작업은 `409`, 없으면 `404` |
+
+- **POST는 같은 사이트에서만:** 두 POST는 `Content-Type: application/json`이어야 하고(아니면 `415`; 취소는 본문 `{}`), 브라우저가 `Sec-Fetch-Site: cross-site`/`same-site`이거나 `Origin`이 이 서버가 아니라고 알리면 `403`이다.
+  다른 웹 페이지가 운영자의 브라우저를 통해 작업을 만들거나 취소하지 못하게 하기 위해서다(JSON이면 CORS 사전 요청이 필요한데 이 서버는 답하지 않는다). curl·e2e처럼 브라우저가 아닌 클라이언트는 헤더 없이 그대로 쓴다. `/ws`·`/ws/live`는 `websocket.Accept`가 다른 출처를 거절한다.
+- **모든 응답에 `X-Fleetd-Boot`:** 서버 실행마다 새로 정하는 ID. 이벤트 번호는 재시작하면 1부터 다시 시작하므로, 대시보드는 이 값이 바뀌면 이벤트를 처음부터 다시 받는다.
+- **로봇이 보낸 값 검사:** 위치 |x|·|y| > 1,000,000 m, NaN·Inf, 속도 |v| > 100 m/s, 배터리가 0~100 밖, `silence_s`가 0~3600 밖이면 그 메시지를 통째로 버리고(로그 + `Registry.Rejected` 수) 로봇은 마지막 정상 값을 유지한다.
+  아주 큰 값이 반올림에서 Inf가 되어 JSON 인코딩이 실패하고 fleetd가 죽던 문제(리뷰 5-1)를 막는다.
 
 ## 연결 상태
 
@@ -174,3 +190,55 @@ scripts\e2e.bat
   `dock_failed`가 나온다. `detail`은 `<종류>: <배터리 %, cmd_id 등>`. 작업을 돌려줄 때는 `type: "task"`의 `requeued`(사유 `battery critical`)가 나온다.
 - **mock으로 빨리 보기:** `python mock_robots\mock_fleet.py --count 1 --prefix bat --origin-x 25 --battery 30 --drain-per-m 3 --charge-rate 10`
   (e2e가 쓰는 설정). 4 m 작업 하나로 약 18%가 되어 도크로 가고 몇 초 만에 충전된다.
+
+## 대시보드
+
+`http://127.0.0.1:8080/` (fleetd의 `-http` 주소). 파일은 `web/`에 있고 `go:embed`로 서버에 들어가므로 인터넷 없이 동작한다.
+
+- **화면:** 위쪽에 연결 상태(위치·이벤트 WebSocket 각각)와 로봇·작업 수, 층 선택, 지도, 로봇 목록(상태 색, 배터리 막대, 충전 필요 ⚡, 현재 작업),
+  작업 목록(1초마다 + 작업 이벤트마다 새로 읽음, 진행 중 작업에 취소 버튼), 이벤트 로그(`/ws`, 최신이 위, 200개까지).
+- **지도:** 1 m 격자(축소하면 5 m). 보이는 범위는 그 층의 로봇·충전 위치·진행 중 작업 지점이 모두 들어가게 맞추고, 같은 층에 있는 동안은 넓어지기만 한다(로봇이 움직여도 화면이 흔들리지 않게).
+  충전 위치는 서버가 모르므로 로봇이 `CHARGING`으로 보인 자리를 표시한다.
+- **로봇 색:** ONLINE은 모드별(대기 회색, 이동 파랑, 도킹·충전 초록, 오류 빨강), STALE은 흐린 점선, OFFLINE은 어두운 색에 X, IN_ELEVATOR와 엘리베이터 모드는 보라.
+  원 + 진행 방향 선 + 이름. 진행 중 작업은 지점(번호)과 배정된 로봇에서 다음 지점까지 선으로 그린다(대기 중 작업은 점선).
+- **조작:** 지도를 클릭하면 그 층의 그 지점으로 작업 하나를 바로 보내고, 3초 동안 "작업 t-N 보냄 [취소]" 알림을 띄운다(잘못 누른 클릭을 되돌리기 위해. 확인 창이나 보조 키보다 간단해서 이쪽을 골랐다).
+  Shift+클릭으로 지점을 모은 뒤 "작업 보내기"로 여러 구간 작업. 작업 목록의 "취소"로 진행 중 작업을 취소.
+- **연결:** 두 WebSocket은 끊기면 지수 백오프(0.5초~10초, jitter)로 다시 연결하고 "연결 끊김" 띠를 보인다. 서버는 바뀐 것이 없어도 2초마다 `heartbeat` 묶음을 보내므로,
+  위치 연결에서 5초 동안 아무것도 오지 않으면 "응답 없음"으로 표시하고 다시 연결한다(멈춘 연결이 "연결됨"으로 남지 않게).
+- **이벤트 로그:** 번호(`seq`) 순서로만 보여 준다. 이어지지 않는 이벤트가 오면 붙잡아 두고 `/events?since=`로 빠진 것을 받아 순서대로 채운다. 서버가 이미 지운 것만 건너뛰고 "이벤트 N개 … 보이지 않음"을 남긴다.
+  다시 연결될 때 `X-Fleetd-Boot`가 바뀌었으면(서버 재시작) 처음부터 다시 받는다.
+- **부드러운 움직임:** 브라우저는 서버 시각 기준 350 ms 뒤를 그리며 받은 위치 사이를 보간한다(묶음 두 개보다 조금 더: 거의 항상 앞의 위치가 있다). 그래도 최신 위치를 지나면,
+  이동 중인 로봇은 속도·방향으로 최대 250 ms까지 더 움직이고 멈춘다. 멈춰 있다 출발한 로봇은 직전까지 그 자리에 둔다. 층이 바뀌면 보간하지 않고 옮긴다.
+- **멀리 있는 점:** |x|·|y| > 1,000,000 m인 점은 화면 범위 계산에서 뺀다. 격자는 축마다 200줄을 넘지 않도록 간격을 1·5·10·50… m로 늘린다(리뷰 5-2: 먼 점 하나로 화면이 멈췄다).
+
+### `/ws/live` 묶음
+
+```json
+{"type":"delta","seq":42,"time":"2026-11-03T09:00:01.35+09:00",
+ "robots":[{"name":"robot_1","host":"e2e","conn":"ONLINE","floor":1,"x":3.214,"y":2.5,"yaw":1.571,"v":0.8,
+            "has_pose":true,"mode":"MOVING","battery":71.3,"battery_known":true,"needs_charge":false,
+            "task_id":"t-3.0.1.k3x9ab","error":""}],
+ "removed":[]}
+```
+
+- 서버는 0.15초(`-frame`)마다 레지스트리를 한 번 읽어, 앞 묶음과 비교해 **보이는 값이 바뀐 로봇만** 넣은 묶음 하나를 만든다(위치는 1 mm, 각도 1 mrad, 배터리 0.1% 단위로 비교).
+  바뀐 것이 없으면 보내지 않는다. 묶음은 **한 번만 JSON으로 만들고** 같은 바이트를 모든 브라우저에 보낸다.
+- `seq`는 묶음마다 1씩 는다. 새 브라우저는 먼저 `type: "snapshot"`(모든 로봇, 지금 `seq`)을 받고 그 뒤 `delta`를 받는다.
+- 2초 동안 바뀐 것이 없으면 `type: "heartbeat"`(로봇 없음, **지금 `seq` 그대로**)를 보낸다. `seq`를 늘리지 않으므로 다음 delta와 빈틈이 생기지 않는다.
+- 값이 NaN·Inf인 로봇(검사를 거치지 않고 들어온 경우)은 그 로봇만 이전 값으로 두고 건너뛴다. 묶음 인코딩이 실패하면 기록하고 그 묶음을 건너뛴다(패닉하지 않는다).
+- **느린 브라우저:** 브라우저마다 대기열(8개)이 있다. 가득 차면 대기열에 남은(오래된) 묶음을 모두 버리고 지금 상태의 스냅샷 하나를 넣는다.
+  버린 delta 위에 다음 delta를 얹으면 바뀐 값을 잃으므로, 버린 뒤 브라우저가 받는 다음 묶음은 항상 스냅샷이다(전송 쪽이 대기열을 비우는 동안 꺼내 간 묶음 중 이어지지 않는 delta도 버린다).
+  그래서 모든 delta가 도착해야 맞는 구조가 아니다. 한 브라우저가 느려도 다른 브라우저는 기다리지 않는다. 쓰기는 5초 제한, 넘으면 연결을 닫는다. 버린 수는 `GET /live/stats`.
+- **충전 필요 표시**(`needs_charge`)는 작업 관리자의 배터리 정책 값(`task.Manager.NeedsCharge`, 읽기만)이다.
+
+### 잠금 순서
+
+순환이 없도록 아래 방향으로만 잡는다(왼쪽을 잡은 채 오른쪽을 잡을 수 있고, 반대는 없다).
+
+```
+task.Manager.mu → fleet.Registry.mu → 이벤트 번호(main의 seqMu) → events.Hub.mu → events.Sub.mu
+```
+
+- `Registry`는 잠금 안에서 이벤트를 내보내고(→ 번호 → 허브), 작업 관리자는 `Tick`에서 레지스트리를 읽는다(관리자 → 레지스트리). 레지스트리는 관리자를 부르지 않는다.
+- `live.Broadcaster.mu`는 잎(leaf)이다. `Tick`은 레지스트리 `Snapshot`과 관리자 `NeedsCharge`를 **각각 따로, 다른 잠금 없이** 부르고 나서 자기 잠금을 잡으며,
+  그 안에서는 막히지 않는 채널 작업만 한다. `NeedsCharge`도 레지스트리를 먼저 읽고 관리자 잠금을 잡으므로 둘을 겹쳐 잡지 않는다. 아무도 다른 잠금을 쥔 채 broadcaster를 부르지 않는다.

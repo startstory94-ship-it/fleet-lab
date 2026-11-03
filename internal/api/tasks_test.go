@@ -24,7 +24,7 @@ func newTaskServer(t *testing.T) (*httptest.Server, *task.Manager, *fleet.Regist
 	hub := events.NewHub()
 	g := fleet.NewRegistry(fleet.DefaultConfig(), hub.Publish)
 	m := task.NewManager(task.DefaultConfig(), task.Deps{Robots: g, Sender: nopSender{}})
-	srv := httptest.NewServer(New(g, hub, m, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	srv := httptest.NewServer(New(g, hub, m, nil, slog.New(slog.NewTextHandler(io.Discard, nil))))
 	t.Cleanup(srv.Close)
 	return srv, m, g
 }
@@ -69,6 +69,7 @@ func TestPostTask(t *testing.T) {
 		`{"waypoints":[{"x":1,"y":2,"floor":1.5}]}`, // floor not an integer
 		`{"waypoints":[{"x":1,"y":2,"floor":1,"z":0}]}`,
 		`{"waypoint":[{"x":1,"y":2,"floor":1}]}`,
+		`{"waypoints":[{"x":1e17,"y":2,"floor":1}]}`, // outside ±1e6 m
 	} {
 		var e map[string]string
 		if code := post(t, srv.URL+"/tasks", body, &e); code != http.StatusBadRequest || e["error"] == "" {
@@ -184,7 +185,7 @@ func TestPostTaskStoreFailure(t *testing.T) {
 	hub := events.NewHub()
 	g := fleet.NewRegistry(fleet.DefaultConfig(), hub.Publish)
 	m := task.NewManager(task.DefaultConfig(), task.Deps{Robots: g, Sender: nopSender{}, Store: brokenStore{}})
-	srv := httptest.NewServer(New(g, hub, m, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	srv := httptest.NewServer(New(g, hub, m, nil, slog.New(slog.NewTextHandler(io.Discard, nil))))
 	defer srv.Close()
 
 	var e map[string]string
@@ -194,5 +195,55 @@ func TestPostTaskStoreFailure(t *testing.T) {
 	var list []task.Task
 	if get(t, srv.URL+"/tasks", &list); len(list) != 0 {
 		t.Fatalf("unsaved task listed: %+v", list)
+	}
+}
+
+// Another web site must not be able to create or cancel tasks through the
+// operator's browser.
+func TestPostsRefuseOtherSites(t *testing.T) {
+	srv, _, _ := newTaskServer(t)
+	body := `{"waypoints":[{"x":1,"y":1,"floor":1}]}`
+	send := func(path, ctype string, hdr map[string]string) int {
+		req, _ := http.NewRequest("POST", srv.URL+path, strings.NewReader(body))
+		if ctype != "" {
+			req.Header.Set("Content-Type", ctype)
+		}
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	host := strings.TrimPrefix(srv.URL, "http://")
+	for _, path := range []string{"/tasks", "/tasks/t-1/cancel"} {
+		for _, tc := range []struct {
+			name, ctype string
+			hdr         map[string]string
+			want        int
+		}{
+			{"no content type", "", nil, http.StatusUnsupportedMediaType},
+			{"form", "application/x-www-form-urlencoded", nil, http.StatusUnsupportedMediaType},
+			{"text/plain", "text/plain", nil, http.StatusUnsupportedMediaType},
+			{"cross-site fetch", "application/json", map[string]string{"Sec-Fetch-Site": "cross-site"}, http.StatusForbidden},
+			{"same-site, other port", "application/json", map[string]string{"Sec-Fetch-Site": "same-site"}, http.StatusForbidden},
+			{"foreign origin", "application/json", map[string]string{"Origin": "http://evil.example"}, http.StatusForbidden},
+			{"bad origin", "application/json", map[string]string{"Origin": "::"}, http.StatusForbidden},
+		} {
+			if got := send(path, tc.ctype, tc.hdr); got != tc.want {
+				t.Errorf("%s %s = %d, want %d", path, tc.name, got, tc.want)
+			}
+		}
+	}
+	// The dashboard itself: same origin, JSON with a charset.
+	same := map[string]string{"Origin": "http://" + host, "Sec-Fetch-Site": "same-origin"}
+	if got := send("/tasks", "application/json; charset=utf-8", same); got != http.StatusCreated {
+		t.Fatalf("same-origin POST /tasks = %d, want 201", got)
+	}
+	if got := send("/tasks/t-1/cancel", "application/json", same); got != http.StatusOK {
+		t.Fatalf("same-origin cancel = %d, want 200", got)
 	}
 }
