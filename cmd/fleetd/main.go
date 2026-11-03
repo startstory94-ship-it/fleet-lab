@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"fleetlab/internal/api"
+	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
 	"fleetlab/internal/mqttx"
 )
@@ -45,7 +46,23 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	registry := fleet.NewRegistry()
+	hub := events.NewHub()
+	registry := fleet.NewRegistry(fleet.DefaultConfig(), func(e fleet.Event) {
+		log.Info("event", "robot", e.Robot, "type", e.Type, "from", e.From, "to", e.To, "detail", e.Detail)
+		hub.Publish(e)
+	})
+	go func() {
+		t := time.NewTicker(250 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				registry.Tick()
+			}
+		}
+	}()
 
 	mq, err := mqttx.Connect(ctx, log, cfg.mqttURL, "fleetd", []mqttx.Subscription{
 		{Topic: fleet.TopicPose, QoS: 0},
@@ -57,7 +74,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, log), ReadHeaderTimeout: 5 * time.Second}
 
 	go func() {
 		log.Info("http listening", "addr", cfg.httpAddr)

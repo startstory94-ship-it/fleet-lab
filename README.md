@@ -8,7 +8,8 @@ ROS 2 mock 로봇과 Go 관제 서버(fleetd)로 만드는 로봇 플릿 관제 
 | 폴더 | 내용 |
 |---|---|
 | `cmd/fleetd` | 관제 서버 진입점 |
-| `internal/fleet` | 로봇 목록, seq 검사, MQTT 메시지 수신 |
+| `internal/fleet` | 로봇 목록, seq 검사, 연결 상태(ONLINE/STALE/OFFLINE/IN_ELEVATOR), MQTT 메시지 수신 |
+| `internal/events` | 이벤트 배포 (느린 수신자는 건너뜀), 최근 이벤트 보관 |
 | `internal/mqttx` | MQTT 연결 (재접속 백오프 + jitter, 재구독) |
 | `internal/api` | REST API |
 | `mock_robots/` | ROS 2 mock 로봇 (Gazebo 없음) |
@@ -49,3 +50,35 @@ mosquitto_pub -t fleet/robot_1/cmd -q 1 -m "{\"cmd_id\":\"c1\",\"type\":\"goto\"
 ```
 
 명령 종류: `goto`(x, y, yaw), `cancel`, `dock`, `reset_error`, `drop_comms`. 결과는 `fleet/<robot>/cmd_ack`로 온다.
+`goto`는 `accepted` 뒤에 `done` / `failed` / `cancelled`가 한 번 더 온다. 수행 중에는 로봇 상태의 `task_id`가 그 `cmd_id`다.
+같은 `cmd_id`를 다시 보내면 실행하지 않고 마지막 응답을 다시 보낸다.
+
+## 테스트
+
+```bat
+go test ./...
+cd C:\pixi_ws && pixi run python -m pytest C:\Users\han\Documents\fleet-lab\adapter
+scripts\e2e.bat
+```
+
+`e2e.bat`은 서버·mock 로봇·어댑터를 실제로 띄워 시나리오 17개를 돌린다(약 1분, Mosquitto 필요).
+테스트 목록과 리뷰는 [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
+
+## API
+
+| 경로 | 내용 |
+|---|---|
+| `GET /robots`, `GET /robots/{name}` | 로봇 상태 (`conn` 포함) |
+| `GET /events?n=50` | 최근 이벤트 (최대 200개) |
+| `GET /ws` | WebSocket 실시간 이벤트 |
+
+## 연결 상태
+
+| 상태 | 조건 |
+|---|---|
+| `ONLINE` | 정상 수신 |
+| `STALE` | 2초 이상 무응답 (와이파이 로밍 등). 하던 작업은 유지 |
+| `OFFLINE` | 20초 이상 무응답, 또는 어댑터 LWT |
+| `IN_ELEVATOR` | 로봇이 `silence_s`로 끊김을 예고함. 그 시간이 지나면 `elevator_overdue` 경보 |
+
+복구는 연속 3번 정상 수신 후에 한다. 로밍 끊김은 `mock_fleet.py --roam-rate 6 --roam-max 4`로 흉내 낸다.

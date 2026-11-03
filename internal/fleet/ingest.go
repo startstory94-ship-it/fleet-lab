@@ -21,7 +21,17 @@ func Ingest(g *Registry, log *slog.Logger) func(topic string, payload []byte) {
 			return
 		}
 		if parts[1] == "adapter" {
-			log.Info("adapter status", "host", parts[2], "payload", string(payload))
+			var st struct {
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal(payload, &st); err != nil {
+				log.Warn("bad adapter status", "topic", topic, "err", err)
+				return
+			}
+			log.Info("adapter status", "host", parts[2], "status", st.Status)
+			if st.Status == "offline" {
+				g.AdapterOffline(parts[2])
+			}
 			return
 		}
 		name, kind := parts[1], parts[2]

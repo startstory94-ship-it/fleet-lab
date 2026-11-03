@@ -9,7 +9,7 @@ ROS 2 -> MQTT
   /<name>/robot_state         -> fleet/<name>/state  QoS 1, on change + every 1 s
 MQTT -> ROS 2
   fleet/<name>/cmd            -> goal_pose / cancel / dock / reset_error / drop_comms
-                              <- fleet/<name>/cmd_ack
+                              <- fleet/<name>/cmd_ack  accepted, then done/failed/cancelled for goto
 Adapter liveness
   fleet/adapter/<host>/status  "online" (retained); LWT sends "offline"
 
@@ -17,17 +17,19 @@ Every pose/state message carries `boot` (random per adapter start) and `seq`
 (per robot, per topic, increasing) so the server can drop stale or duplicate
 messages and still accept a restarted adapter whose seq starts over.
 
+The robot itself knows nothing about command ids (like a Nav2 robot). The
+adapter tracks the active goto, reports it as `task_id` in state, and sends the
+final ack. Pure logic lives in fleet_logic.py.
+
 Run:  python fleet_adapter.py [--mqtt-host 127.0.0.1] [--host-id <name>]
 """
 
 import argparse
-import collections
 import json
 import math
 import queue
 import random
 import socket
-import threading
 import time
 import uuid
 
@@ -42,29 +44,23 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-POSE_MAX_HZ = 5.0
-POSE_IDLE_PERIOD = 1.0     # s, pose heartbeat while standing still
-POSE_DEADBAND_M = 0.05
-POSE_DEADBAND_RAD = math.radians(2.0)
-STATE_PERIOD = 1.0         # s, state heartbeat
+from fleet_logic import (POSE_MAX_HZ, CommandBook, GoalTracker, is_live,
+                         pose_due, service_outcome, state_due)
+
 DISCOVERY_PERIOD = 2.0     # s
 KEEPALIVE = 5              # s, MQTT keepalive
 SERVICE_CMDS = ("cancel", "dock", "reset_error", "drop_comms")
-SEEN_CMD_IDS = 256         # per robot, for duplicate suppression
 
 
 def quat_to_yaw(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
-def angle_diff(a, b):
-    return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
-
-
 class RobotBridge:
-    """Per-robot state: latest ROS data, throttling and seq counters."""
+    """Per-robot state: latest ROS data, throttling, seq counters, commands."""
 
     def __init__(self, node, name):
+        self.node = node
         self.name = name
         self.pose_seq = 0
         self.state_seq = 0
@@ -72,7 +68,9 @@ class RobotBridge:
         self.state = None           # dict from robot_state
         self.last_pose_sent = None  # (time, x, y, yaw)
         self.last_state_sent = None # (time, key)
-        self.seen_cmds = collections.OrderedDict()
+        self.last_rx = None         # monotonic time of the last robot_state
+        self.book = CommandBook()
+        self.goal = GoalTracker()
 
         state_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                                durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -92,16 +90,18 @@ class RobotBridge:
         try:
             self.state = json.loads(msg.data)
         except ValueError:
-            pass
+            return
+        now = time.monotonic()
+        self.last_rx = now
+        pos = self.pose[:2] if self.pose else None
+        ended = self.goal.update(self.state, pos, now)
+        if ended:
+            self.node.ack(self, *ended)
 
-    def remember_cmd(self, cmd_id):
-        """Return False if cmd_id was already handled (QoS 1 may redeliver)."""
-        if cmd_id in self.seen_cmds:
-            return False
-        self.seen_cmds[cmd_id] = True
-        while len(self.seen_cmds) > SEEN_CMD_IDS:
-            self.seen_cmds.popitem(last=False)
-        return True
+    def ack(self, cmd_id, status, message=""):
+        body = {"cmd_id": cmd_id, "status": status, "message": message}
+        self.book.record(cmd_id, body)
+        return body
 
 
 class FleetAdapter(Node):
@@ -162,23 +162,22 @@ class FleetAdapter(Node):
     def send(self, topic, body, qos):
         self.mqtt.publish(topic, json.dumps(body, separators=(",", ":")), qos=qos)
 
+    def ack(self, r, cmd_id, status, message=""):
+        self.send(f"fleet/{r.name}/cmd_ack", r.ack(cmd_id, status, message), qos=1)
+
     # ---- ROS 2 -> MQTT ----
     def publish_poses(self):
         now = time.monotonic()
         for r in self.robots.values():
-            if r.pose is None or r.state is None:
+            if r.pose is None or not is_live(r.last_rx, now):
                 continue
             x, y, yaw, v, frame = r.pose
-            if r.last_pose_sent is not None:
-                t0, x0, y0, yaw0 = r.last_pose_sent
-                moved = math.hypot(x - x0, y - y0) >= POSE_DEADBAND_M or \
-                    angle_diff(yaw, yaw0) >= POSE_DEADBAND_RAD
-                if not moved and now - t0 < POSE_IDLE_PERIOD:
-                    continue
+            if not pose_due(r.last_pose_sent, now, x, y, yaw):
+                continue
             r.pose_seq += 1
             r.last_pose_sent = (now, x, y, yaw)
             self.send(f"fleet/{r.name}/pose", {
-                "boot": self.boot, "seq": r.pose_seq, "stamp": time.time(),
+                "boot": self.boot, "seq": r.pose_seq, "stamp": time.time(), "host": self.host_id,
                 "frame": frame, "floor": r.state.get("floor", 1),
                 "x": round(x, 3), "y": round(y, 3), "yaw": round(yaw, 3), "v": round(v, 3),
             }, qos=0)
@@ -186,20 +185,20 @@ class FleetAdapter(Node):
     def publish_states(self):
         now = time.monotonic()
         for r in self.robots.values():
-            s = r.state
-            if s is None:
+            if not is_live(r.last_rx, now):
                 continue
-            key = (s.get("mode"), s.get("error"), s.get("task_id", ""))
-            if r.last_state_sent is not None:
-                t0, key0 = r.last_state_sent
-                if key == key0 and now - t0 < STATE_PERIOD:
-                    continue
+            s = r.state
+            key = (s.get("mode"), s.get("error"), r.goal.active_id, s.get("silence_s", 0))
+            if not state_due(r.last_state_sent, now, key):
+                continue
             r.state_seq += 1
             r.last_state_sent = (now, key)
             self.send(f"fleet/{r.name}/state", {
                 "boot": self.boot, "seq": r.state_seq, "stamp": time.time(),
+                "host": self.host_id,
                 "mode": s.get("mode"), "battery": s.get("battery"),
-                "task_id": s.get("task_id", ""), "error": s.get("error", ""),
+                "task_id": r.goal.active_id, "error": s.get("error", ""),
+                "silence_s": s.get("silence_s", 0),
             }, qos=1)
 
     # ---- MQTT -> ROS 2 ----
@@ -223,43 +222,45 @@ class FleetAdapter(Node):
             self.get_logger().warn(f"bad cmd on {topic}: {payload[:120]!r}")
             return
 
-        def ack(status, message=""):
-            self.send(f"fleet/{r.name}/cmd_ack",
-                      {"cmd_id": cmd_id, "status": status, "message": message}, qos=1)
-
-        if not r.remember_cmd(cmd_id):
-            return  # duplicate delivery; the first copy was already acked
-        expires = cmd.get("expires_at")
-        if expires is not None and time.time() > expires:
-            ack("failed", "expired")
+        verdict = r.book.check(cmd_id, cmd.get("expires_at"), time.time())
+        if verdict == CommandBook.DUPLICATE:
+            # Do not run it again, but repeat the last ack: the server re-sends
+            # because it never saw that ack.
+            last = r.book.last_ack(cmd_id)
+            if last is not None:
+                self.send(f"fleet/{r.name}/cmd_ack", last, qos=1)
+            return
+        if verdict == CommandBook.EXPIRED:
+            self.ack(r, cmd_id, "failed", "expired")
             return
 
         if kind == "goto":
             try:
-                goal = PoseStamped()
-                goal.header.frame_id = cmd.get("frame", "map")
-                goal.header.stamp = self.get_clock().now().to_msg()
-                goal.pose.position.x = float(cmd["x"])
-                goal.pose.position.y = float(cmd["y"])
+                x, y = float(cmd["x"]), float(cmd["y"])
                 yaw = float(cmd.get("yaw", 0.0))
-                goal.pose.orientation.z = math.sin(yaw / 2.0)
-                goal.pose.orientation.w = math.cos(yaw / 2.0)
             except (KeyError, TypeError, ValueError):
-                ack("failed", "goto needs numeric x and y")
+                self.ack(r, cmd_id, "failed", "goto needs numeric x and y")
                 return
+            goal = PoseStamped()
+            goal.header.frame_id = cmd.get("frame", "map")
+            goal.header.stamp = self.get_clock().now().to_msg()
+            goal.pose.position.x, goal.pose.position.y = x, y
+            goal.pose.orientation.z = math.sin(yaw / 2.0)
+            goal.pose.orientation.w = math.cos(yaw / 2.0)
+            preempted = r.goal.start(cmd_id, x, y, time.monotonic())
+            if preempted:
+                self.ack(r, preempted, "cancelled", f"preempted by {cmd_id}")
             r.goal_pub.publish(goal)
-            ack("accepted")
+            self.ack(r, cmd_id, "accepted")
         elif kind in SERVICE_CMDS:
             client = r.clients[kind]
             if not client.service_is_ready():
-                ack("failed", f"{kind} service not available")
+                self.ack(r, cmd_id, "failed", f"{kind} service not available")
                 return
             future = client.call_async(Trigger.Request())
-            future.add_done_callback(
-                lambda f: ack("accepted" if f.result() and f.result().success else "failed",
-                              f.result().message if f.result() else "no response"))
+            future.add_done_callback(lambda f: self.ack(r, cmd_id, *service_outcome(f)))
         else:
-            ack("failed", f"unknown command type {kind!r}")
+            self.ack(r, cmd_id, "failed", f"unknown command type {kind!r}")
 
     def close(self):
         # A clean shutdown says offline itself; the LWT only covers crashes.
