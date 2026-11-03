@@ -163,5 +163,19 @@ def test_new_goal_reports_preempted_one():
     assert g.active_id == "c2"
 
 
+def test_cancel_before_robot_shows_goal_is_cancelled_not_failed():
+    g = GoalTracker()
+    g.start("c1", 3.0, 2.0, now=0.0)
+    # The cancel lands before the robot's next state, so "started" was never seen.
+    assert g.cancel("cancel requested by x") == ("c1", "cancelled", "cancel requested by x")
+    assert g.active_id == ""
+    # Later states and the start timeout must not report c1 again.
+    assert g.update(st("IDLE"), (0.0, 0.0), GOAL_START_TIMEOUT + 1) is None
+
+
+def test_cancel_without_goal_is_noop():
+    assert GoalTracker().cancel("x") is None
+
+
 def test_no_goal_no_output():
     assert GoalTracker().update(st("IDLE"), (0, 0), 1.0) is None

@@ -9,7 +9,7 @@
 | 종류 | 도구 | 속도 | 언제 |
 |---|---|---|---|
 | 단위 | `go test`, 가짜 시계 | 1초 안 | 단계마다, 로직마다 |
-| 통합 | `go test` + `internal/sim` 가짜 로봇·엘리베이터 + Mosquitto | 수 초 | 3단계부터 |
+| 통합 | `go test` + `internal/sim` 가짜 로봇(엘리베이터는 6단계) | 1초 안 | ✅ 3단계부터 |
 | 실제 환경 | ROS 2 mock 로봇 + 어댑터 + Mosquitto (수동 → 스크립트화) | 수십 초 | 단계 완료 기준 확인 |
 | 부하 | `cmd/loadtest` | 분 단위 | 7단계 |
 | 어댑터 | `pytest` (ROS 없이 순수 로직만) | 1초 안 | 🔧 지금부터 |
@@ -51,18 +51,54 @@
 | WebSocket `/ws` 실제 연결 | 🔧 없음 | `httptest` 서버 + websocket 클라이언트로 한 개 |
 | 실제 환경: 로밍, 25초 끊김, 어댑터 종료 | ✅ 수동으로 확인 | 1단계와 같은 문제(재현 불가) |
 
-## 3단계: 작업 배정 (계획)
+## 3단계: 작업 배정
 
 | 테스트 | 상태 | 리뷰 |
 |---|---|---|
-| 가장 가까운 로봇, 같은 층 우선 | ⬜ | 거리가 같을 때 결정 규칙(이름순 등)도 정해 두어야 테스트가 흔들리지 않는다 |
-| STALE·OFFLINE·ERROR·배터리 부족 로봇 제외 | ⬜ | 표 테스트로 |
-| 응답 없으면 재전송, 횟수 초과면 실패, 유효 기간 | ⬜ | ❗ 아래 문제 1과 함께 |
-| 수행 중 OFFLINE·ERROR면 재배정, 돌아온 로봇의 작업 취소 | ⬜ | 좋음 |
-| 서버 재시작 후 SQLite에서 복구 | ⬜ | 좋음. 복구 직후 로봇 상태가 아직 없을 때의 동작도 정해야 한다 |
-| 같은 명령 두 번 → 한 번만 실행 | ⬜ | 좋음 |
-| 🔧 작업 완료 판정이 이전 상태 메시지에 속지 않음 | 🔧 | ❗ 아래 문제 4 |
-| 🔧 작업 10개를 3대가 나눠 끝냄, 같은 작업을 두 로봇이 하지 않음 | 🔧 | 통합 테스트 |
+| 가장 가까운 로봇, 같은 층 우선 | ✅ `TestNearestRobot` | 다른 층은 층마다 1000 m 벌점, 거리가 같으면 이름순. 가짜 로봇 목록을 일부러 정렬하지 않고 넘겨 이름순 규칙을 확인 |
+| 대기열은 먼저 온 순서 | ✅ `TestQueueIsFIFO` | |
+| STALE·OFFLINE·ERROR·배터리 부족 로봇 제외 | ✅ `TestEligibility` (표 12줄) | IN_ELEVATOR, 바쁜 모드, IDLE인데 에러, 다른 `task_id` 보고, 이미 작업 보유도 포함 |
+| 응답 없으면 같은 `cmd_id` 재전송, 횟수 초과면 실패, 유효 기간 | ✅ `TestResendSameCmdIDThenFail`, `TestGotoCommand` | `expires_at`은 보낼 때마다 새로 계산. 답 없는 로봇을 CHARGING으로 치워 두던 부분을 없앰(리뷰 3) |
+| STALE이면 재전송 시간을 세지 않음 | ✅ `TestStaleRobotPausesResends` | |
+| `done`이면 다음 구간, 중복 `done`은 두 구간을 넘기지 않음 | ✅ `TestDoneAdvancesLegs` | |
+| `failed`/`cancelled`면 재배정, 시도 횟수 초과면 FAILED | ✅ `TestFailedAndCancelledRequeueUntilMaxAttempts` | |
+| 옛 `cmd_id`·다른 로봇의 응답 무시 | ✅ `TestStaleAndForeignAcksIgnored` | |
+| 로봇 상태의 `task_id`도 `accepted`로 봄 | ✅ `TestRobotReportCountsAsAccepted` | `accepted`가 유실돼도 재배정하지 않아 두 로봇이 같은 작업을 하지 않는다 |
+| `done` 유실 → 같은 `cmd_id` 재전송으로 되찾음 | ✅ `TestLostDoneAckIsAskedAgain` | 어댑터가 마지막 응답을 다시 보내는 것(문제 1 수정)에 기댄다 |
+| 수행 중 OFFLINE·ERROR면 재배정, STALE·엘리베이터는 유지 | ✅ `TestRobotLoss` | |
+| 돌아온 로봇이 옛 작업을 하고 있으면 취소 | ✅ `TestReturnedRobotWithOldTaskIsCancelled` | 취소 응답이 없으면 3초마다 다시 보냄 |
+| 사용자 취소는 재배정하지 않음 | ✅ `TestUserCancel` | |
+| 이벤트 순서, 바뀔 때마다 저장 | ✅ `TestEventsAndPersistence` | |
+| SQLite 저장·읽기 | ✅ `TestRoundTrip`, `TestReopenKeepsData` | |
+| 서버 재시작 후 SQLite에서 복구 | ✅ `TestRestartRules`, `TestRestoredLegFinishedWhileDown`, `TestNewIDsContinueAfterRestart`, `TestRestoreGraceStartsAtLinkUp`, `TestRestoreKeepsTaskOfUnreachableRobot` | 유예는 MQTT 첫 연결부터 25초. 위치만 온 로봇은 아직 모름. STALE·엘리베이터 로봇은 OFFLINE까지 기다림. 그 사이 한 번 같은 `cmd_id`로 물어 서버가 꺼진 동안 끝난 구간을 `done`으로 받는다 |
+| 손상된 행은 건너뛰고 시작, 그 번호는 다시 쓰지 않음 | ✅ `TestCorruptRowIsSkipped` | |
+| REST `/tasks` 네 개, 400·404·409 | ✅ `TestPostTask`, `TestGetTasks`, `TestCancelTask` | |
+| 같은 명령 두 번 → 한 번만 실행 | ✅ e2e (어댑터) + `internal/sim` 의 `Started` 검사 | |
+| 🔧 작업 완료 판정이 이전 상태 메시지에 속지 않음 | ✅ | 완료는 상태가 아니라 `cmd_id`가 맞는 `done` 응답으로만 판단한다. 어댑터 쪽은 문제 4 수정 |
+| 작업 10개를 3대가 나눠 끝냄, 같은 작업을 두 로봇이 동시에 하지 않음 | ✅ `TestTenTasksThreeRobots` (`internal/sim`) | 매 250 ms마다 "한 작업에 로봇 하나" 검사 |
+| 수행 중 고장 → 재배정 후 완료 | ✅ `TestFaultMidTaskIsReassigned` | |
+| 20초 넘게 조용함 → 재배정, 돌아온 로봇은 취소 | ✅ `TestSilentRobotIsReplacedAndCancelledOnReturn` | |
+| 응답 30% 유실에도 모두 완료 | ✅ `TestDroppedAcksStillFinishEverything` | 리뷰 뒤 sim에 지연·순서 뒤바뀜을 넣고 시드 300개×(유실 0%, 30%), 지연 0~1.2초로 따로 돌려 봄: 600번 모두 완료, 겹침 0번 |
+| 취소가 goto보다 먼저 도착해도 다시 취소 | ✅ `TestCancelOvertakenByGotoIsCancelledAgain` | 시드 20개 중 11개에서 실제로 순서가 뒤바뀜 |
+| sim 겹침 검사가 실제로 잡는지 | ✅ 수동 확인 | 지켜보기 취소를 잠시 끄면 `TestSilentRobot…`과 `TestCancelOvertaken…`이 "driven by robot_1 and robot_2 at once" 등으로 실패함을 확인 |
+| 실제 환경: 작업 6개 완료·로봇마다 1개 이상, 수행 중 서버 재시작 후 완료 | ✅ `scripts/e2e.py` 9·10번 (시나리오 24개) | 재시작 뒤 작업이 재배정되지 않고(`dispatches == 1`) 이어지는지도 확인 |
+
+### 3단계 리뷰 (2026-11-03, 모두 수정함)
+
+리뷰어가 1·2·3·5를 실패하는 테스트로 증명했다. 그 테스트는 `internal/task/review_test.go`의 `TestReview*`로 옮겼다(수정 전 5개 모두 실패, 수정 후 통과).
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 높음 | 재시작 직후 위치만 보낸 로봇(Mode `""`)을 보고 지켜보기를 버림. 유예가 프로세스 시작부터 5초 | 상태가 없는 로봇은 "모름"으로 보고 지켜보기 유지. 유예는 MQTT 첫 연결(`LinkUp`)부터, OFFLINE 기준(20초)+5초 이상(25초). STALE·엘리베이터 로봇은 OFFLINE까지 기다림 | `TestReviewRestartOrphanDroppedOnFirstPose`, `TestRestoreGraceStartsAtLinkUp`, `TestRestoreKeepsTaskOfUnreachableRobot` |
+| 2 높음 | 로봇이 한 번 다른 `task_id`를 보고하면 지켜보기를 버림(명령이 아직 오는 중일 수 있음) | 마지막 goto/cancel을 보낸 시각 + `CmdTTL` + 5초까지 유지. 안전망: ONLINE 로봇이 자기 것이 아닌 알려진 작업의 `cmd_id`를 3초 넘게 보고하면 취소(3초마다) | `TestReviewCancelAssignedOrphanDropped`, `TestReviewNoResponseOrphanDroppedImmediately`, `TestWatchEndsAfterCmdCanNoLongerLand`, `TestNoCancelForBriefStaleReportAfterDone` |
+| 3 중상 | ONLINE인데 답 없는 로봇이 같은 작업을 계속 다시 받아 FAILED, 다른 로봇은 놀고 있음 | 작업마다 실패한 로봇 목록(`failed_on`)을 두고 다른 로봇이 비어 있으면 건너뜀. 답 없어 실패한 로봇은 1분 쉼 | `TestReviewDeafRobotBurnsAllAttempts`, `TestCooldownMakesRobotIneligible`, `TestFailedRobotUsedWhenNoOtherIsFree` |
+| 4 중 | 지켜보기 목록이 메모리에만 있음 | 2의 안전망으로 대신함(저장하지 않음). 재시작 뒤 돌아온 로봇이 옛 `cmd_id`를 수행 중이면 취소됨을 확인 | `TestReturningRobotCancelledAfterRestart` |
+| 5 중 | 저장 실패를 무시(201 응답, 재시작 뒤 ID·`cmd_id` 재사용 → 어댑터가 옛 응답을 돌려줘 새 작업이 움직이지 않고 DONE) | `Submit`은 저장한 뒤에만 작업을 만들고 실패하면 오류(API 500). `cmd_id`에 서버 실행 ID를 넣음. 상태 변경 저장이 실패하면 남겨 두고 다시 시도(메모리 상태가 기준). 손상된 행 이후 번호도 재사용 안 함(`MaxSeq`) | `TestReviewIDReuseAfterFailedSave`, `TestCmdIDsDifferAcrossBoots`, `TestFlushRetriesFailedWrites`, `TestPostTaskStoreFailure` |
+| 6 낮음 | 관리자 잠금 안에서 SQLite 쓰기(busy_timeout 5초) — MQTT 수신이 멈출 수 있음 | 잠금 안에서는 바뀐 작업만 표시하고, 별도 고루틴(`RunWriter`)이 작업마다 최신 상태를 순서대로 씀. 종료 때 한 번 더 씀 | `TestFlushRetriesFailedWrites`, 저장 확인 테스트들(`Flush` 사용) |
+| 7 낮음 | 시간 제한이 없어 RUNNING이 영원히 갈 수 있음 | 구간마다 거리/0.3 m/s + 30초. 넘으면 로봇 취소 후 재배정. STALE·엘리베이터 시간은 빼고 셈 | `TestLegTimeout` |
+| 8 낮음 | API가 JSON 뒤 데이터를 받아 줌, 큰 본문에 400 | 뒤에 데이터가 있으면 400, `http.MaxBytesReader`로 1 MB 넘으면 413 | `TestPostTaskBodyLimits` |
+| 테스트 | sim에 지연이 없어 "두 로봇 금지" 검사가 실패할 수 없음 | sim에 명령·응답 지연과 무작위 지연(순서 뒤바뀜 가능), 시작할 때 위치가 상태보다 먼저. 겹침 검사를 250 ms 틱 사이 50 ms마다, 조용한 로봇 테스트에서도 처음부터(링크가 끊긴 로봇과 돌아온 지 2초 안의 로봇은 서버가 멈출 수 없으므로 제외) | `TestCancelOvertakenByGotoIsCancelledAgain`, 기존 sim 테스트 4개 |
+| 테스트 | 만료(`expired`) 응답 | 시도 1번을 쓰고 다른 로봇이 끝냄, 취소는 보내지 않음 | `TestExpiredAckUsesAnAttempt` |
 
 ## 4단계: 배터리 (계획)
 
@@ -153,3 +189,7 @@
 2. **지금 바로 (작음):** 문제 5, 백오프·Ingest·API 단위 테스트, 이벤트 보관 테스트 보강
 3. **3단계와 함께:** 문제 3, 6
 4. **나중에:** 문제 2
+
+### 3단계 확인 중 추가로 찾은 문제 (어댑터)
+- `goto` 직후 로봇이 다음 상태(2 Hz)를 보내기 전에 `cancel`이 도착하면, 어댑터가 목표 시작을 못 봐서 3초 뒤 `failed: robot did not take the goal`로 끝냈다.
+  e2e "cancelled goto reported"가 간헐적으로 실패해 발견했다. `cancel`·`dock` 서비스가 성공하면 추적 중인 `goto`를 바로 `cancelled`로 끝내도록 고쳤다(`GoalTracker.cancel`, pytest 2개 추가).

@@ -1,7 +1,7 @@
 """End-to-end scenarios: fleetd + ROS 2 mock robots + adapter + Mosquitto.
 
 Starts everything, runs each scenario against the real processes, prints
-PASS/FAIL per step and exits non-zero on any failure. Takes about a minute.
+PASS/FAIL per step and exits non-zero on any failure. Takes about two minutes.
 
 Needs: Mosquitto on 127.0.0.1:1883, Go on PATH, and a shell where ROS 2 is
 set up (pixi shell + local_setup.bat). Use scripts\\e2e.bat on Windows.
@@ -34,6 +34,20 @@ def step(name, ok, detail=""):
 def http_json(path):
     with urllib.request.urlopen(API + path, timeout=2) as r:
         return json.load(r)
+
+
+def post_json(path, body):
+    req = urllib.request.Request(API + path, data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=2) as r:
+        return json.load(r)
+
+
+def task(task_id):
+    try:
+        return http_json("/tasks/" + task_id)
+    except Exception:
+        return None
 
 
 def robot(name):
@@ -93,15 +107,24 @@ def main():
     logs = {n: open(os.path.join(tmp, n + ".log"), "w") for n in ("fleetd", "robots", "adapter")}
     print(f"logs: {tmp}")
 
+    fleetd_cmd = [exe, "-http", API.removeprefix("http://"), "-db", os.path.join(tmp, "f.db")]
+
+    def restart_fleetd():
+        """Hard-kill fleetd and start it again on the same database."""
+        procs["fleetd"].kill()
+        procs["fleetd"].wait()
+        logs["fleetd2"] = open(os.path.join(tmp, "fleetd2.log"), "w")
+        procs["fleetd"] = start(fleetd_cmd, logs["fleetd2"])
+
     procs = {
-        "fleetd": start([exe, "-http", API.removeprefix("http://"), "-db", os.path.join(tmp, "f.db")], logs["fleetd"]),
+        "fleetd": start(fleetd_cmd, logs["fleetd"]),
         "robots": start([sys.executable, "-u", "mock_robots/mock_fleet.py", "--count", "3", "--seed", "1",
                          "--drop-seconds", str(DROP_SECONDS)], logs["robots"]),
         "adapter": start([sys.executable, "-u", "adapter/fleet_adapter.py", "--host-id", "e2e"], logs["adapter"]),
     }
     m = Mqtt()
     try:
-        run(m, procs)
+        run(m, procs, restart_fleetd)
     finally:
         for p in procs.values():
             if p.poll() is None:
@@ -114,7 +137,7 @@ def main():
     sys.exit(1 if failed else 0)
 
 
-def run(m, procs):
+def run(m, procs, restart_fleetd):
     names = ["robot_1", "robot_2", "robot_3"]
 
     # 1. connection
@@ -176,7 +199,33 @@ def run(m, procs):
     seqs = [e["seq"] for e in http_json("/events?n=200")]
     step("event seq strictly increasing", all(b == a + 1 for a, b in zip(seqs, seqs[1:])), seqs[:10])
 
-    # 9. adapter crash -> LWT -> all OFFLINE. kill() is a hard kill (no clean
+    # 9. tasks over REST: 6 single-waypoint tasks shared by the 3 robots
+    spots = [(1.0, 3.0), (5.0, 3.0), (3.0, 5.0), (0.0, 4.0), (6.0, 1.0), (2.0, 6.0)]
+    ids = [post_json("/tasks", {"waypoints": [{"x": x, "y": y, "floor": 1}]})["id"] for x, y in spots]
+    step("6 tasks submitted", len(set(ids)) == 6, ids)
+    wait_for(lambda: all(task(i)["state"] == "DONE" for i in ids), 60)
+    final = [task(i) or {} for i in ids]
+    step("6 tasks DONE", all(t.get("state") == "DONE" for t in final),
+         [(t.get("id"), t.get("state"), t.get("robot")) for t in final])
+    who = {t.get("robot") for t in final}
+    step("every robot did at least one task", set(names) <= who, sorted(map(str, who)))
+
+    # 10. server restart while tasks run: they continue and finish
+    spots = [(0.0, 9.0), (4.0, 10.0), (8.0, 7.0)]
+    ids2 = [post_json("/tasks", {"waypoints": [{"x": x, "y": y, "floor": 1}]})["id"] for x, y in spots]
+    running = wait_for(lambda: all(task(i)["state"] == "RUNNING" for i in ids2), 10)
+    step("3 tasks RUNNING before restart", bool(running), [(task(i) or {}).get("state") for i in ids2])
+    restart_fleetd()
+    back = wait_for(lambda: all(task(i) for i in ids + ids2), 20)
+    step("fleetd restarted with tasks restored", bool(back) and all(task(i)["state"] == "DONE" for i in ids))
+    wait_for(lambda: all(task(i)["state"] == "DONE" for i in ids2), 60)
+    final = [task(i) or {} for i in ids2]
+    step("3 tasks DONE after restart", all(t.get("state") == "DONE" for t in final),
+         [(t.get("id"), t.get("state"), t.get("robot"), t.get("error")) for t in final])
+    step("restart did not reassign running tasks", all(t.get("dispatches") == 1 for t in final),
+         [(t.get("id"), t.get("dispatches"), t.get("error")) for t in final])
+
+    # 11. adapter crash -> LWT -> all OFFLINE. kill() is a hard kill (no clean
     # "offline" message), so only the broker's LWT can report it.
     procs["adapter"].kill()
     step("adapter crash takes all robots OFFLINE",

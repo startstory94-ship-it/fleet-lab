@@ -52,7 +52,8 @@ type Event struct {
 	Seq    uint64    `json:"seq"`
 	Time   time.Time `json:"time"`
 	Robot  string    `json:"robot"`
-	Type   string    `json:"type"` // seen, conn, mode, error, elevator_overdue, adapter
+	Type   string    `json:"type"` // seen, conn, mode, error, elevator_overdue, adapter, task
+	Task   string    `json:"task,omitempty"`
 	From   string    `json:"from,omitempty"`
 	To     string    `json:"to,omitempty"`
 	Detail string    `json:"detail,omitempty"`
@@ -115,6 +116,10 @@ func NewRegistry(cfg Config, emit func(Event)) *Registry {
 	}
 	return &Registry{robots: make(map[string]*Robot), cfg: cfg, now: time.Now, emit: emit}
 }
+
+// SetClock replaces the clock used for liveness, for tests and simulations.
+// Call it before the registry is used.
+func (g *Registry) SetClock(now func() time.Time) { g.now = now }
 
 // get returns the robot, creating it (with a "seen" event) on first contact.
 func (g *Registry) get(name string, now time.Time, evs []Event) (*Robot, []Event) {
