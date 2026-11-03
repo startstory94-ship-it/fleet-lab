@@ -11,8 +11,8 @@
 | 단위 | `go test`, 가짜 시계 | 1초 안 | 단계마다, 로직마다 |
 | 통합 | `go test` + `internal/sim` 가짜 로봇(엘리베이터는 6단계) | 1초 안 | ✅ 3단계부터 |
 | 실제 환경 | ROS 2 mock 로봇 + 어댑터 + Mosquitto (수동 → 스크립트화) | 수십 초 | 단계 완료 기준 확인 |
-| 부하 | `cmd/loadtest` | 분 단위 | 7단계 |
-| 어댑터 | `pytest` (ROS 없이 순수 로직만) | 1초 안 | 🔧 지금부터 |
+| 부하 | `cmd/loadtest` (실제 fleetd + Mosquitto) | 약 9분 | ✅ 7단계, [LOAD_TEST.md](LOAD_TEST.md) |
+| 어댑터 | `pytest` (ROS 없이: 순수 로직 + 가짜 rclpy로 배선) | 1초 안 | ✅ 1단계 리뷰부터, CI |
 
 ---
 
@@ -155,7 +155,7 @@
 | 테스트가 실제로 잡는지 | ✅ 수동 확인 | 변이: ① 빈틈 delta 걸러내기 제거 → `TestConcurrentSubscribers` 실패 ② 버린 뒤 스냅샷 대신 delta → `TestSlowSubscriberResyncs`·`TestPartialReader…` 실패 ③ 새 묶음을 버림(옛것 유지) → 세 테스트 실패 |
 | 실제 환경 | ✅ `scripts/e2e.py` 12번 (시나리오 4개 추가, 모두 35개) | `GET /` 200 HTML, `/ws/live` 첫 묶음이 모든 로봇의 스냅샷, 작업을 받은 로봇의 x/y가 묶음마다 바뀜(5초에 24번), 간격 중앙값 150 ms, seq 빈틈 없음. pixi 환경에 WebSocket 라이브러리가 없어 스크립트 안에 최소 RFC 6455 클라이언트를 넣음. 두 번 연속 35/35 |
 | 대시보드 JS (DOM 없는 부분) | ✅ `node scripts/web_test.js` (23개) | `poseAt` 보간·±π 회전·같은 시각 두 점·외삽(250 ms 상한, 멈춤·IDLE은 안 함), `gridLines` 200줄 상한·1e17 근처 부동소수·NaN, `inRange`, `EventFeed` 빈틈 채우기·채우는 중 도착·중복·서버가 지운 것 건너뛰기·첫 로드·실패 후 재시도·재시작(번호 감소, 실행 ID 변경) |
-| 화면 그리기·클릭 | ⬜ 자동 테스트 없음 | `demo.bat` + 앱 안 브라우저로 확인(아래 5단계 리뷰). 데모 GIF는 7단계 |
+| 화면 그리기·클릭 | ⬜ 자동 테스트 없음 | `demo.bat` + 앱 안 브라우저로 확인(아래 5단계 리뷰). 데모 GIF·스크린샷은 아직 없음(README "화면"에 찍을 장면만 적음) |
 
 ### 5단계 구현 중 찾은 문제 (수정함)
 
@@ -181,7 +181,7 @@
 
 브라우저 확인(`demo.bat`, 앱 안 브라우저): 클릭 → 3초 알림 → "취소" → `CANCELLED`; 2층 작업을 만들면 층 버튼에 2층이 생기고 누르면 그 층 지점만 보임; 작업 목록 "취소"로 수행 중 작업 취소(로봇 멈춤);
 `drop_comms`를 8초마다 보내 robot_2를 STALE(흐린 점선 원) → OFFLINE(어두운 원에 X) → 복구; fleetd를 끄면 "연결 끊김" 띠와 두 배지 "끊김", 다시 켜면 띠가 사라지고 "서버가 다시 시작됨" 알림 뒤 새 서버의 이벤트가 처음부터 보임.
-확인하지 못한 것: 연결은 살아 있는데 서버가 멈춘 경우의 "응답 없음"(서버를 죽이면 소켓이 바로 닫혀서 재현 못 함, heartbeat 쪽은 Go 테스트로만), IN_ELEVATOR 그리기(6단계 전이라 mock이 보내지 않음).
+확인하지 못한 것: 연결은 살아 있는데 서버가 멈춘 경우의 "응답 없음"(서버를 죽이면 소켓이 바로 닫혀서 재현 못 함, heartbeat 쪽은 Go 테스트로만), IN_ELEVATOR 그리기(6단계 전이라 mock이 보내지 않음. 6b에서 `demo.bat`로 확인함).
 
 ## 6단계: 목적층이 다른 로봇 함께 태우기 ⭐ (6a: 서버·sim·프로토콜, 6b: 실제 프로세스)
 
@@ -314,13 +314,38 @@ sim 쪽에서 처음 살아남은 2개(문 구역 확인 없이 turn, turn 재�
 
 **6b에서 하지 않은 것:** 엘리베이터 응답 없음·문 막힘은 주입 옵션만 있고 e2e 단계는 없다(`internal/sim`·`internal/elevator`의 Go 테스트와 `cmd/mockelevator` 테스트가 검사). 어댑터를 탑승 중 재시작하면 ride를 잃는다(로봇이 `in_car`이면 ERROR로 보고해 배정은 막지만 운행을 이어받지는 않음: 사람이 꺼내야 함). 서버 재시작 중 탑승 e2e 없음. mock 로봇의 "움직이다 고장" 처리(리뷰 4)는 자동 테스트가 없다.
 
-## 7단계: 마무리 (계획)
+## 7단계: 마무리
 
 | 테스트 | 상태 | 리뷰 |
 |---|---|---|
-| CI에서 `go test -race` | ⬜ | 이 PC는 C 컴파일러가 없어 `-race`를 못 돌린다. CI가 유일한 검사 수단 |
-| 부하 3종 비교 | ⬜ | 🔧 한 번만 재면 편차가 크다. 3~5번 재서 중앙값을 쓴다 |
-| 🔧 CI에서 Mosquitto 띄워 통합 테스트 | 🔧 | GitHub Actions 서비스 컨테이너로 가능 |
+| CI에서 `go test -race` | ✅ 작성 (CI 실행은 push 뒤) | `.github/workflows/ci.yml`의 `go` 잡: gofmt 검사·`go vet`·`go test -race -count=1 ./...`·Windows 교차 빌드. 이 PC는 C 컴파일러가 없어 `-race`를 못 돌리므로 경합은 코드를 읽어 찾았다: `api.writeTimeout`을 테스트가 바꾸고 되돌리는 동안 앞 테스트의 WebSocket 핸들러 고루틴이 읽을 수 있었다(httptest는 하이재킹된 연결을 기다리지 않음) → `api.New`에서 한 번 읽어 핸들러에 넘김. 나머지 동시성 테스트(`live` 동시 구독, 레지스트리 이벤트 순서, outbox, 허브)는 잠금·원자값·채널로만 공유함을 확인. 전체가 `-race` 없이 몇 초라 10배 느려져도 짧다 |
+| CI: 대시보드 JS, 어댑터 pytest | ✅ 작성 | `node` 잡(`node scripts/web_test.js`), `python` 잡(Python 3.12 + pytest + paho-mqtt, ROS 없음). `test_adapter_wiring.py`는 rclpy·메시지·paho 모듈을 가짜로 넣고 `fleet_adapter`를 읽는다. ROS 없는 시스템 Python(3.12, 임시 venv)에서 직접 돌려 통과 확인 |
+| 🔧 CI에서 Mosquitto 띄워 통합 | ✅ 작성 | Go·Python 테스트는 브로커가 필요 없어 서비스 컨테이너는 쓰지 않았다. 대신 `loadtest-smoke` 잡이 apt로 Mosquitto를 깔고 fleetd를 띄워 작은 부하 테스트(로봇 300대, 브라우저 4개 중 느림 1, 끊김 폭풍, `-check`)를 한 번 돈다. 숫자 크기는 보지 않고 기능만(로봇 ONLINE, 브라우저 오류 0, 묶음 받음, 느린 브라우저 때문에 버림·스냅샷 발생, 모두 재접속) 확인한다(7단계 리뷰 7). Linux에서 처음 도는 경로(`/proc` CPU 읽기 포함)라 push 뒤 확인 필요 |
+| 부하 3종 비교 | ✅ `cmd/loadtest`, [LOAD_TEST.md](LOAD_TEST.md) | 실제 fleetd(시나리오마다 새로 띄움)에 MQTT 로봇 500대 + WebSocket 브라우저 20개(2개 느림). 묶음 인코딩 한 번 vs 브라우저마다(`-bench-encode-per-client`), 느린 브라우저 버림 vs 기다림(`-bench-block-slow`), 동시 재접속 jitter 있음 vs 없음(끊김 2.5초·3.5초), 브라우저 60개에서 인코딩 비교 한 번 더. 시나리오마다 3번, 중앙값과 범위. 처음 돌렸을 때 찾은 측정 문제: `/live/stats`가 기다리기 모드에서 잠금을 기다리는 동안 다른 카운터를 늦게 읽어 위치 수신이 2,435/s로 적게 나옴 → 로컬 값을 먼저 읽고 stats는 마지막에. jitter 없는 폭풍에서 시도가 왜 7초에 또 오는지 몰라 실패 원인을 기록하게 했더니 접속 대기열 거절("actively refused")이었다 |
+| 벤치 스위치가 정말 동작하는지 | ✅ `TestBenchEncodePerClient`, `TestBenchBlockOnSlow`, `TestBenchBlockTimeoutFallsBack` | 스위치가 아무것도 안 하면 부하 테스트가 기본값을 자기 자신과 비교하게 된다. 브라우저 5개면 delta 하나에 인코딩 5번·서로 다른 버퍼, 기다리기는 버림·스냅샷 0번·모든 delta 도착, 시간 초과면 버림으로 돌아감. 각 스위치를 꺼 보는 변이로 실패 확인 |
+| 부하 테스트 도구 자체 | ✅ `cmd/loadtest` 단위 5개 | 묶음 머리 읽기(type·time), 백분위·100 ms 칸 최대·히스토그램, 중앙값 요약, jitter 없는 백오프, `-check` 조건(`TestFrameRunCheck`) |
+| 7단계 변경 뒤 회귀 | ✅ 수동 | gofmt·`go vet`(Windows·Linux)·`go test ./...`, node 31/31, pytest 74개(pixi ROS 환경 + ROS 없는 시스템 Python 3.12 venv 둘 다), `scripts\e2e.bat` 71/71(`.bat`을 CRLF로 바꾼 뒤). CI 자체는 push 전이라 실행 못 함 |
+
+### 7단계 리뷰 (2026-11-03, 모두 반영)
+
+| # | 지적 | 수정 |
+|---|---|---|
+| 1 중 (측정됨) | LOAD_TEST가 느린 브라우저는 "항상 최신 상태"를 받는다고 했는데, 잰 나이는 중앙값 3.4초·최대 4.0초 | `cmd/loadtest`가 느린 브라우저가 읽은 delta·스냅샷의 상태 나이를 잼(p50·p99·최대, 받은 스냅샷 수). 다시 잰 값: 버림 3.3초·4.0초, 기다림 7.0초·7.9초. 문장을 고치고, 8칸 대기열 + 소켓 버퍼가 하는 일과 나이를 묶는 방법(최신 하나만, 작은 대기열, 쓰기 버퍼·흐름 제어)을 적음. README 알려진 한계에 추가. fleetd 동작은 그대로 |
+| 2 중 | "끊김 길이와 상관없이 약 6초"는 2.5·3.5초 두 값뿐 | "잰 두 끊김(2.5·3.5초)에서 5.7~6.0초", 더 긴 끊김은 재지 않음이라고 씀 |
+| 3 중 | 거절 수 "47~188"이 3.5초 표(149 [14–188])와 안 맞음 | 끊김별 중앙값과 범위로: 2.5초 105 [47–181], 3.5초 149 [14–188], 합쳐 14~188 |
+| 4 중 | 거절한 것은 Mosquitto가 아니라 부하 테스트의 Go 프록시 listen 소켓 | README·LOAD_TEST에 그렇게 쓰고, 브로커에 직접 붙었을 때의 거절은 재지 않은 추측이라고 표시 |
+| 5 낮 | "pose messages in"은 가짜 로봇이 보낸 수 | 이름을 "pose messages sent by the fake robots"로(`report.go`, `PosesSent`) |
+| 6 낮 | Go 테스트 함수 수가 틀림 | 명령으로 다시 셈: `go test -list . ./...`의 `Test` 줄 207개(리뷰 뒤 `TestFrameRunCheck` 추가 포함, 그 전 206개), `go test -count=1 -v ./...`의 `--- PASS` 줄 271개(하위 테스트 포함, 맨 앞 줄만 207개). pytest `74 passed`, node `31/31 web tests passed`, e2e `71/71 passed` |
+| 7 낮 | CI 스모크가 버림·기다림 경로를 거치지 않고, 묶음 0개나 브라우저 오류로도 통과 | `loadtest -check`: 브라우저 오류(연결된 뒤의 끊김; 503 다시 시도는 제외) > 0, 빠른 브라우저 묶음 0, 느린 브라우저가 있는데 버림 0 또는 받은 스냅샷 0(기다림 시나리오는 버림 조건 제외)이면 실패. CI는 로봇 300대, 느린 브라우저 1초마다 + 받는 버퍼 32 KB(`-slow-rcvbuf`, Linux 소켓 버퍼가 커서), 예열·측정 10초. `TestFrameRunCheck`가 조건마다 실패함을 확인. 이 PC에서 같은 명령 통과(버림 5.6/s, 스냅샷 4). Linux에서는 push 뒤 확인 필요 |
+| 8 낮 | 스모크 실패 때 fleetd 로그가 지워짐 | `-keep-logs`, 실패하면 `/tmp/loadtest-fleetd-*/fleetd.log`를 출력하는 단계(`if: failure()`) |
+| 9 낮 | `internal/elevator/config.go`의 `TurnTimeout` 주석이 "다음 로봇이 움직인다" | 같은 로봇의 실패한 시도이고 다음 로봇은 `door_zone: 0` 뒤에만이라고 고침 |
+| 10 낮 | 액션 버전, 중복 실행, Windows vet | `gh api repos/actions/<name>/releases/latest`: checkout v7.0.1, setup-go v7.0.0, setup-node v7.1.0, setup-python v7.1.0 → 모두 `@v7`. `concurrency`(브랜치/PR마다 하나, 옛 실행 취소). `GOOS=windows go vet ./...` 추가 |
+| 11 참고 | `-race` 후보(sqlite checkptr, 시간에 민감한 테스트) | 바꾼 것 없음. `-race`는 checkptr도 켜므로 modernc.org/sqlite 쪽에서 걸릴 수 있다는 점만 기록(로컬에서 확인 불가, CI 첫 실행에서 볼 것) |
+| 12 낮 | fleetd `-h`가 형 이름을 빼고 `(default "")`를 찍음 | 숨은 스위치만 뺀 새 FlagSet에 나머지를 옮겨 표준 `PrintDefaults`로 출력 |
+| 13 낮 | 시나리오를 차례로 돌려 PC 상태 변화가 한 시나리오에 몰릴 수 있음 | 번갈아(A B C A B C …) 돌림. 묶음 세 시나리오와 브라우저 60개 비교를 다시 잼(LOAD_TEST 표 교체). 재접속 폭풍 표는 그 전 값 그대로(표시함) |
+| 14 정보 | 기다림 p99 ≈ 1,001 ms를 "느린 2개 × 0.5초"로 설명한 것은 추측 | 느린 브라우저 1개로 3번 잼: p99 1000.4~1002.1 ms. 그 설명은 틀렸다고 쓰고 원인은 확인 못 함으로 표시 |
+| 기타 | 그림 파일 | `.gitattributes`에 `*.png binary`, `*.gif binary` |
+
 
 ---
 

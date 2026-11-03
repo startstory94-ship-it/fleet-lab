@@ -1,0 +1,103 @@
+# Runs every test that does not need ROS 2. The e2e scenarios
+# (scripts/e2e.bat) need ROS 2 Jazzy and stay local; see README.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# A push to a branch with an open PR triggers both events: keep one run per
+# branch/PR and cancel the older one.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go (gofmt, vet, test -race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet (linux, windows)
+        run: |
+          go vet ./...
+          GOOS=windows go vet ./...
+      # The development PC has no C compiler, so this is the only place the
+      # race detector runs. All tests use fake clocks or short real waits;
+      # the whole suite takes seconds without -race.
+      - name: go test -race
+        run: go test -race -count=1 ./...
+      - name: Windows build
+        run: GOOS=windows GOARCH=amd64 go build ./...
+
+  node:
+    name: Dashboard JS (node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: node scripts/web_test.js
+
+  python:
+    name: Adapter (pytest, no ROS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest paho-mqtt
+      # test_adapter_wiring.py loads fleet_adapter.py with fake rclpy and
+      # message modules; the other two test the pure logic in fleet_logic.py.
+      - run: python -m pytest -q adapter -p no:cacheprovider
+
+  loadtest-smoke:
+    name: Load test smoke (fleetd + Mosquitto)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: go
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Mosquitto
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q mosquitto
+          for i in $(seq 50); do nc -z 127.0.0.1 1883 && exit 0; sleep 0.2; done
+          echo "mosquitto did not start"; exit 1
+      # A functional check, not a benchmark: shared runners are too noisy for
+      # numbers (docs/LOAD_TEST.md has the measured ones). -check fails the
+      # job on any WebSocket client error, on fast clients getting no frames,
+      # and unless the slow client really made fleetd drop frames and send a
+      # catch-up snapshot. Linux socket buffers are big, so the slow client
+      # reads one frame a second through a 32 KB receive buffer. The storm
+      # scenarios fail unless every robot reconnects and shows ONLINE again.
+      - name: loadtest (small)
+        run: |
+          go build -o bin/fleetd ./cmd/fleetd
+          go run ./cmd/loadtest -fleetd bin/fleetd -robots 300 -clients 4 -slow 1 \
+            -slow-delay 1s -slow-rcvbuf 32768 -warmup 10s -window 10s -repeat 1 \
+            -check -keep-logs
+      - name: fleetd logs
+        if: failure()
+        run: |
+          for f in /tmp/loadtest-fleetd-*/fleetd.log; do echo "== $f"; cat "$f"; done || true

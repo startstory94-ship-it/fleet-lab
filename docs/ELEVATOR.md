@@ -282,7 +282,7 @@ exiting   안에 있을 수 있는 로봇 중 가장 문 쪽(칸 번호가 가�
 | `AcceptTimeout` (`accept_timeout_s`) | 10초 | 계획 후 이 안에 모두 수락 안 하면 중단. 그 사이 3초마다 같은 `cmd_id`로 재전송 |
 | `CallMargin` (`call_margin_s`) | 15초 | 엘리베이터가 출발층에서 문을 열기까지 예상 시간 + 이만큼 |
 | `Silence` (`silence_s`) | 5초 | 엘리베이터 상태가 이만큼 없으면 응답 없음(탑승 전이면 중단) |
-| `TurnTimeout` (`turn_timeout_s`) | 15초 | `zone`이 없으면 다음 로봇에게 turn |
+| `TurnTimeout` (`turn_timeout_s`) | 15초 | `zone`이 없으면 그 turn을 닫고 같은 로봇의 실패한 시도로 센다(다음 로봇은 1장 ③대로 `door_zone: 0`을 본 뒤에만) |
 | `ExitRetries` (`exit_retries`) | 1 | 하차 실패 시 같은 층에서 다시 주는 turn 수 |
 | `HoldRefresh` / `HoldFor` | 5초 / 15초 | 문 유지 재요청 간격 / 한 번에 요청하는 시간 |
 | `CmdRetry` (`cmd_retry_s`) | 5초 | `call`/`goto` 재전송 간격 |

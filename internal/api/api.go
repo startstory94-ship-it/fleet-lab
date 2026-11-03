@@ -40,6 +40,9 @@ type Elevators interface {
 
 // New builds the HTTP handler. frames may be nil; /ws/live then answers 503.
 func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, frames *live.Broadcaster, log *slog.Logger) http.Handler {
+	// Read once here: handlers run on their own goroutines and may outlive a
+	// test that changes writeTimeout (go test -race).
+	wt := writeTimeout
 	mux := http.NewServeMux()
 	routeTasks(mux, tasks)
 	routeDashboard(mux)
@@ -48,7 +51,7 @@ func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, frames *live.Broadcast
 			writeError(w, http.StatusServiceUnavailable, "live frames are off")
 			return
 		}
-		serveLive(w, r, frames, log)
+		serveLive(w, r, frames, wt, log)
 	})
 	mux.HandleFunc("GET /live/stats", func(w http.ResponseWriter, r *http.Request) {
 		if frames == nil {
@@ -110,7 +113,7 @@ func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, frames *live.Broadcast
 		writeJSON(w, http.StatusOK, hub.Recent(n))
 	})
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
-		serveEvents(w, r, hub, log)
+		serveEvents(w, r, hub, wt, log)
 	})
 	// Event numbers start again at 1 when fleetd restarts. Every response
 	// carries this run's id so a client can tell a restart from more events.
@@ -125,7 +128,7 @@ func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, frames *live.Broadcast
 const BootHeader = "X-Fleetd-Boot"
 
 // serveEvents streams live events to one WebSocket client.
-func serveEvents(w http.ResponseWriter, r *http.Request, hub *events.Hub, log *slog.Logger) {
+func serveEvents(w http.ResponseWriter, r *http.Request, hub *events.Hub, writeTimeout time.Duration, log *slog.Logger) {
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -156,14 +159,14 @@ func serveEvents(w http.ResponseWriter, r *http.Request, hub *events.Hub, log *s
 
 // writeTimeout bounds one WebSocket write. A client that cannot take a frame
 // in this time is closed; until then the broadcaster drops frames for it
-// without waiting. A variable so tests can shorten it.
+// without waiting. A variable so tests can shorten it (before New).
 var writeTimeout = 5 * time.Second
 
 // serveLive streams position frames to one WebSocket client. The bytes are
 // the broadcaster's, shared with every other client; they are only written.
 // Beyond the broadcaster's subscriber limit it answers 503 before upgrading.
 // (websocket.Accept also refuses a browser page from another origin.)
-func serveLive(w http.ResponseWriter, r *http.Request, frames *live.Broadcaster, log *slog.Logger) {
+func serveLive(w http.ResponseWriter, r *http.Request, frames *live.Broadcaster, writeTimeout time.Duration, log *slog.Logger) {
 	sub, unsubscribe, err := frames.Subscribe()
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
