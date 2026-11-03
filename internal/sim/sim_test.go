@@ -24,6 +24,9 @@ type world struct {
 	// left out of the check until reconnectGrace after its link returns.
 	checkOverlap bool
 	linkBack     map[string]time.Time
+
+	// onEvent sees every manager event as it happens (lock held).
+	onEvent func(task.Event)
 }
 
 const (
@@ -44,7 +47,12 @@ func newWorld(t *testing.T, seed uint64) *world {
 	for i, name := range []string{"robot_1", "robot_2", "robot_3"} {
 		w.fl.Add(name, float64(2*i), 0)
 	}
-	w.mgr = task.NewManager(task.DefaultConfig(), task.Deps{Now: clock, Robots: w.reg, Sender: w.fl})
+	w.mgr = task.NewManager(task.DefaultConfig(), task.Deps{Now: clock, Robots: w.reg, Sender: w.fl,
+		Emit: func(e task.Event) {
+			if w.onEvent != nil {
+				w.onEvent(e)
+			}
+		}})
 	w.fl.OnAck(w.mgr.HandleAck)
 	w.mgr.LinkUp()
 	w.fl.Step(0) // first reports: poses only, states follow
@@ -279,4 +287,108 @@ func TestCancelOvertakenByGotoIsCancelledAgain(t *testing.T) {
 		t.Fatal("no seed made the goto arrive after the cancel; the test proves nothing")
 	}
 	t.Logf("goto overtook the cancel in %d of 20 runs", overtaken)
+}
+
+// Robots start low and drain fast: each one must go and charge, the others
+// keep working, nobody gets a task while it needs charge, and no task is
+// driven by two robots.
+func TestLowBatteryFleetChargesAndFinishes(t *testing.T) {
+	w := newWorld(t, 5)
+	w.checkOverlap = true
+	w.fl.SetBatteryModel(1.5, 10) // % per metre, % per second
+	names := []string{"robot_1", "robot_2", "robot_3"}
+	for i, name := range names {
+		w.fl.SetBattery(name, 30+float64(5*i))
+	}
+	cfg := task.DefaultConfig()
+	flagged := map[string]bool{}
+	seen := map[string]map[string]int{}
+	w.onEvent = func(e task.Event) {
+		if seen[e.Robot] == nil {
+			seen[e.Robot] = map[string]int{}
+		}
+		seen[e.Robot][e.Type+"/"+e.Kind]++
+		switch {
+		case e.Type == "battery" && e.Kind == "low":
+			flagged[e.Robot] = true
+		case e.Type == "battery" && e.Kind == "charged":
+			flagged[e.Robot] = false
+		case e.Type == "task" && e.Kind == "assigned":
+			r, _ := w.reg.Get(e.Robot)
+			if flagged[e.Robot] || r.Battery < cfg.LowBattery {
+				t.Errorf("%s: %s assigned to %s at %.1f%% while it needs charge",
+					w.now.Format("15:04:05.000"), e.Task, e.Robot, r.Battery)
+			}
+		}
+	}
+	for i := range 20 {
+		x := float64(i%5) - 1
+		y := float64(i%4) + 1
+		if i%3 == 0 {
+			w.submit(wp(x, y), wp(x+1, -y))
+		} else {
+			w.submit(wp(x, y))
+		}
+	}
+	w.runUntil("all DONE", 20*time.Minute, w.allDone)
+
+	for _, name := range names {
+		r := w.fl.Robot(name)
+		if r.Charges == 0 || seen[name]["battery/charged"] == 0 {
+			t.Errorf("%s never charged: %d dock arrivals, events %v", name, r.Charges, seen[name])
+		}
+		if r.Mode == "ERROR" {
+			t.Errorf("%s ran flat: %+v", name, r)
+		}
+		if hasDuplicate(r.Started) {
+			t.Errorf("%s ran a goto twice: %v", name, r.Started)
+		}
+		if seen[name]["task/assigned"] == 0 {
+			t.Errorf("%s did no task: %v", name, seen[name])
+		}
+	}
+	for _, tk := range w.mgr.List("") {
+		if tk.Attempts != 0 {
+			t.Errorf("%s used %d attempts (%s); battery must not cost attempts", tk.ID, tk.Attempts, tk.Error)
+		}
+	}
+	t.Logf("finished at +%s; events %v", w.now.Sub(time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)), seen)
+}
+
+// Long zigzag tasks drain robots below the critical level while they drive:
+// the task is handed back (cancel, requeue once stopped) and another robot
+// finishes it. No attempt is used, nobody runs flat, no overlap.
+func TestCriticalBatteryHandsTasksBack(t *testing.T) {
+	w := newWorld(t, 6)
+	w.checkOverlap = true
+	w.fl.SetBatteryModel(1, 10)
+	names := []string{"robot_1", "robot_2", "robot_3"}
+	for i, name := range names {
+		w.fl.SetBattery(name, 26+float64(i))
+	}
+	handBacks := 0
+	w.onEvent = func(e task.Event) {
+		if e.Type == "task" && e.Kind == "requeued" && strings.Contains(e.Detail, "battery critical") {
+			handBacks++
+		}
+	}
+	for i := range 9 {
+		x := float64(2 * (i % 3))
+		w.submit(wp(x, 5), wp(x, -5), wp(x, 5), wp(x, -5))
+	}
+	w.runUntil("all DONE", 30*time.Minute, w.allDone)
+	if handBacks == 0 {
+		t.Fatal("no task was handed back; the test does not reach the critical level")
+	}
+	for _, tk := range w.mgr.List("") {
+		if tk.Attempts != 0 {
+			t.Errorf("%s used %d attempts (%s)", tk.ID, tk.Attempts, tk.Error)
+		}
+	}
+	for _, name := range names {
+		if r := w.fl.Robot(name); r.Mode == "ERROR" || hasDuplicate(r.Started) {
+			t.Errorf("%s: mode %s error %q, started %v", name, r.Mode, r.Error, r.Started)
+		}
+	}
+	t.Logf("%d hand-backs, finished at +%s", handBacks, w.now.Sub(time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)))
 }

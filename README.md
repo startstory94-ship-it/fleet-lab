@@ -11,9 +11,9 @@ ROS 2 mock 로봇과 Go 관제 서버(fleetd)로 만드는 로봇 플릿 관제 
 | `internal/fleet` | 로봇 목록, seq 검사, 연결 상태(ONLINE/STALE/OFFLINE/IN_ELEVATOR), MQTT 메시지 수신 |
 | `internal/events` | 이벤트 배포 (느린 수신자는 건너뜀), 최근 이벤트 보관 |
 | `internal/mqttx` | MQTT 연결 (재접속 백오프 + jitter, 재구독) |
-| `internal/task` | 작업 배정·명령 재전송·재배정·취소 (가짜 시계로 테스트) |
+| `internal/task` | 작업 배정·명령 재전송·재배정·취소, 배터리 정책(`battery.go`) (가짜 시계로 테스트) |
 | `internal/store` | 작업을 SQLite에 저장 (modernc.org/sqlite, cgo 없음) |
-| `internal/sim` | 통합 테스트용 가짜 로봇 (MQTT·ROS 없이 실제 Registry와 Manager에 연결) |
+| `internal/sim` | 통합 테스트용 가짜 로봇 (MQTT·ROS 없이 실제 Registry와 Manager에 연결, 배터리·도킹 포함) |
 | `internal/api` | REST API |
 | `mock_robots/` | ROS 2 mock 로봇 (Gazebo 없음) |
 | `adapter/` | ROS 2 ↔ MQTT 어댑터 |
@@ -65,8 +65,8 @@ cd C:\pixi_ws && pixi run python -m pytest C:\Users\han\Documents\fleet-lab\adap
 scripts\e2e.bat
 ```
 
-`e2e.bat`은 서버·mock 로봇·어댑터를 실제로 띄워 시나리오 24개를 돌린다(약 2분, Mosquitto 필요).
-작업 배정, 서버 재시작 후 작업 이어가기도 여기서 확인한다.
+`e2e.bat`은 서버·mock 로봇·어댑터를 실제로 띄워 시나리오 31개를 돌린다(약 1분 40초, Mosquitto 필요).
+작업 배정, 서버 재시작 후 작업 이어가기, 배터리 정책(배터리가 낮은 로봇 `bat_1`을 따로 띄움)도 여기서 확인한다.
 테스트 목록과 리뷰는 [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
 
 ## API
@@ -75,6 +75,7 @@ scripts\e2e.bat
 |---|---|
 | `GET /robots`, `GET /robots/{name}` | 로봇 상태 (`conn` 포함) |
 | `GET /events?n=50` | 최근 이벤트 (최대 200개) |
+| `GET /events?since=<seq>` | `seq`보다 뒤의 보관 중인 이벤트. 첫 이벤트가 `seq+1`이 아니면 그 사이는 이미 버려졌다. 숫자가 아니면 `400` |
 | `GET /ws` | WebSocket 실시간 이벤트 |
 | `POST /tasks` | 작업 추가. 본문 `{"waypoints":[{"x":1,"y":2,"floor":1}]}` (x, y, floor 모두 필수, 뒤에 다른 데이터 없음) → `201` + 작업. 형식이 틀리면 `400`, 1 MB 넘으면 `413`, 저장 실패면 `500`(작업은 만들어지지 않음) |
 | `GET /tasks?state=QUEUED` | 작업 목록 (만든 순서). `state`는 선택, 모르는 값이면 `400` |
@@ -103,9 +104,10 @@ scripts\e2e.bat
 | `RUNNING` | 로봇이 이번 구간을 받음 (`accepted` 또는 로봇 상태의 `task_id`가 그 `cmd_id`) |
 | `DONE` / `FAILED` / `CANCELLED` | 끝. 목록에 계속 남는다 |
 
-- **배정:** 먼저 들어온 작업부터. ONLINE·IDLE·에러 없음·배터리 기준 이상(지금은 0%, 4단계에서 올림)·`task_id` 없음·
+- **배정:** 먼저 들어온 작업부터. ONLINE·IDLE·에러 없음·위치를 받은 적 있음·충전 필요 아님(아래 배터리)·`task_id` 없음·
   다른 작업이 없는 로봇 중 다음 지점에 가장 가까운 로봇. 다른 층은 층마다 1000 m를 더한다. 거리가 같으면 이름순.
   그 작업에 실패한 적이 있는 로봇(`failed_on`)은 다른 로봇이 비어 있으면 건너뛴다.
+  상태만 오고 위치(`pose`)가 아직 없는 로봇은 층·좌표가 0으로 보이므로 배정하지 않는다(`has_pose`). 구간 시간 제한도 위치가 온 뒤에 계산한다.
 - **명령 ID:** `<작업>.<구간>.<배정 횟수>.<서버 실행 ID>` (예: `t-3.0.1.k3x9ab`). 서버 실행 ID는 시작할 때마다 새로 정하므로
   마지막 저장이 유실된 채 재시작해도 ID가 겹치지 않는다(겹치면 어댑터가 새 명령을 중복으로 보고 옛 응답을 돌려준다).
   `expires_at`은 보낼 때마다 지금 + 10초.
@@ -130,8 +132,45 @@ scripts\e2e.bat
 - **이벤트:** `/events`, `/ws`에 `type: "task"`로 `assigned`, `running`, `leg_done`, `done`, `requeued`, `failed`, `cancelled`가 나온다.
   로봇 이벤트와 같은 `seq` 번호를 쓴다.
 
-```bat
-curl -X POST http://127.0.0.1:8080/tasks -H "Content-Type: application/json" -d "{\"waypoints\":[{\"x\":3,\"y\":2,\"floor\":1}]}"
-curl http://127.0.0.1:8080/tasks?state=RUNNING
-curl -X POST http://127.0.0.1:8080/tasks/t-1/cancel
-```
+## 배터리
+
+`internal/task/battery.go`. 작업 관리자와 같은 잠금·같은 Tick 안에서 돈다(지켜보기 처리 뒤, 배정 직전). 작업을 돌려받고 배정에서 빼는 일이
+작업 관리자와 얽혀 있어 PLAN의 `internal/policy` 대신 여기에 두었다. 기준은 `task.Config`에 있다.
+
+| 설정 | 기본값 | 뜻 |
+|---|---|---|
+| `LowBattery` | 25% | 이보다 낮아지면 "충전 필요": 새 작업을 받지 않고, 하던 작업을 마치면 도크로 |
+| `ResumeBattery` | 90% | 충전 필요인 로봇은 여기까지 올라와야 다시 배정 대상 |
+| `CriticalBattery` | 10% | 이보다 낮으면(10%는 아님) 하던 작업을 돌려주고 도크로 |
+| `DockTimeout` / `MaxDockTries` / `DockCooldown` | 10초 / 3번 / 1분 | `dock` 재전송과 쉬는 시간 |
+
+- **히스테리시스:** 25% 미만이면 표시하고, 90% 이상이 되어야 표시를 지운다. 그래서 25% 근처에서 배정·제외가 반복되지 않는다.
+  충전이 중간에 끊겨 60%로 IDLE이 된 로봇도 표시가 남아 있으므로 배정되지 않고 다시 도크로 간다.
+  표시를 지우는 것은 배터리 기준이고, 실제 배정은 로봇이 `IDLE`이 된 뒤다(mock은 100%에서 `CHARGING → IDLE`).
+- **충전기가 90% 전에 멈추면:** 표시된 로봇이 `CHARGING`에서 90% 미만으로 `IDLE`이 되면 한 번은 다시 도크로 보낸다.
+  같은 표시 기간에 두 번째로 그러면 받아들인다: 25% 이상이면 표시를 지우고(`charged`, 사유 포함) 배정 대상이 되고,
+  25% 미만이면 `dock_failed`를 내고 1분 쉰 뒤 다시 보낸다. 끝없이 도크를 오가지 않게 하기 위해서다.
+- **도킹:** 표시된 로봇이 ONLINE·IDLE·에러 없음·`task_id` 없음·작업 없음이고, 그 로봇에서 거둔 goto를 지켜보는 중이 아니면(옛 goto가 아직 도착할 수 있음)
+  `dock`을 보낸다(`cmd_id`는 `dock.<로봇>.<번호>.<서버 실행 ID>`, `expires_at`은 다른 명령처럼 지금 + 10초).
+  10초 안에 `DOCKING`/`CHARGING`이 보이지 않으면 새 `cmd_id`로 다시 보내고, 3번 보내도 안 되면 `dock_failed` 이벤트를 내고 1분 쉰다.
+  STALE·OFFLINE·IN_ELEVATOR·ERROR 로봇, 이미 `DOCKING`/`CHARGING`인 로봇에는 보내지 않는다. `dock`이 `failed`로 와도 기록만 하고 시간 제한에 맞춰 다시 보낸다.
+- **도크가 아직 오는 중이면 배정하지 않음:** `dock`을 보낸 뒤 `CmdTTL` + 5초(15초) 동안은 표시가 지워져도 배정하지 않는다.
+  그 사이 도착한 `dock`이 새 goto를 `cancelled`로 끝내 시도 횟수를 쓰게 되는 것을 막는다.
+- **위험 수준(10%) — 작업 돌려주기:** 단순하게 했다. 작업을 **실제로 몰고 있는**(상태의 `task_id`가 그 구간의 `cmd_id`) ONLINE 로봇이 10% 미만을 보고하면,
+  남은 거리와 상관없이 그 로봇에 `cancel`을 보내고 (로봇, `cmd_id`)를 지켜본다(기존 방식, 3초마다 다시 취소). 작업은 **로봇이 멈출 때까지 그 로봇에 남겨 두고**,
+  마지막 응답(`cancelled`/`failed`)이 오면 `QUEUED`로 돌린다. 그 전에 `done`이 오면 마지막 구간이면 `DONE`, 아니면 다음 구간부터 다른 로봇에게 간다.
+  로봇이 멈췄는데 응답이 없으면 같은 `cmd_id`를 다시 보내 어댑터가 마지막 응답을 다시 보내게 한다(어댑터는 같은 ID를 다시 실행하지 않는다). 3번 뒤, 또는 OFFLINE·ERROR면 바로 돌린다.
+  로봇 탓이 아니므로 시도 횟수(`attempts`)와 `failed_on`에 넣지 않는다. 두 로봇이 같은 작업을 동시에 몰지 않는다.
+  - 구간을 보고하지 않는 로봇(IDLE, `task_id` 없음)은 돌려받지 않는다. 방금 구간을 끝냈고 `done`이 오는 중일 수 있다(재시작 뒤 복구 중인 작업도 같다).
+    평소 규칙(응답 대기 → 같은 `cmd_id` 재전송)이 처리하고, 다음 구간이 도착해 로봇이 그것을 보고하면 그때 돌려받는다.
+  - 10%~25%인 로봇은 하던 작업(남은 구간 모두)을 마친다. STALE 로봇의 배터리 값은 오래된 것이라 ONLINE일 때만 판단한다.
+- **모든 로봇이 충전 중:** 배정할 로봇이 없을 뿐이라 작업은 `QUEUED`로 기다린다. 실패 처리하지 않고 시도 횟수도 쓰지 않는다.
+- **배터리 값이 없는 로봇:** 상태의 `battery`가 없거나 `null`이면(`battery_known: false`) 배터리 정책이 판단할 수 없으므로
+  표시하지도, 도크로 보내지도 않고 **배정 대상으로 둔다**(로그에 한 번 경고). 우리 mock과 어댑터는 mock이 주는 값을 그대로 보내지만,
+  배터리를 모르는 실제 로봇이면 `null`이 올 수 있다.
+- **재시작:** 표시는 메모리에만 있다. 재시작 뒤 로봇의 첫 상태 보고로 다시 계산한다: 25% 미만이거나, 90% 미만이면서
+  `DOCKING`/`CHARGING`이면 충전 필요. 재시작 전에 충전이 끊겨 25~90%로 IDLE인 로봇은 표시를 잃고 바로 배정될 수 있다(알려진 한계).
+- **이벤트:** `type: "battery"`로 `low`(표시), `dock_sent`, `docking`(`DOCKING`/`CHARGING`이 보임), `charged`(표시 지움, 다시 배정 대상),
+  `dock_failed`가 나온다. `detail`은 `<종류>: <배터리 %, cmd_id 등>`. 작업을 돌려줄 때는 `type: "task"`의 `requeued`(사유 `battery critical`)가 나온다.
+- **mock으로 빨리 보기:** `python mock_robots\mock_fleet.py --count 1 --prefix bat --origin-x 25 --battery 30 --drain-per-m 3 --charge-rate 10`
+  (e2e가 쓰는 설정). 4 m 작업 하나로 약 18%가 되어 도크로 가고 몇 초 만에 충전된다.

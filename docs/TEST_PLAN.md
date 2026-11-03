@@ -100,13 +100,44 @@
 | 테스트 | sim에 지연이 없어 "두 로봇 금지" 검사가 실패할 수 없음 | sim에 명령·응답 지연과 무작위 지연(순서 뒤바뀜 가능), 시작할 때 위치가 상태보다 먼저. 겹침 검사를 250 ms 틱 사이 50 ms마다, 조용한 로봇 테스트에서도 처음부터(링크가 끊긴 로봇과 돌아온 지 2초 안의 로봇은 서버가 멈출 수 없으므로 제외) | `TestCancelOvertakenByGotoIsCancelledAgain`, 기존 sim 테스트 4개 |
 | 테스트 | 만료(`expired`) 응답 | 시도 1번을 쓰고 다른 로봇이 끝냄, 취소는 보내지 않음 | `TestExpiredAckUsesAnAttempt` |
 
-## 4단계: 배터리 (계획)
+## 4단계: 배터리
 
 | 테스트 | 상태 | 리뷰 |
 |---|---|---|
-| 25% 미만 배정 제외, 하던 일 마친 뒤 충전 | ⬜ | 좋음 |
-| 🔧 25% 근처에서 들어갔다 나왔다 반복하지 않음 | 🔧 | 들어가는 기준(25%)과 다시 배정하는 기준(예: 90%)을 다르게 두고 테스트 |
-| 🔧 모든 로봇이 충전 중일 때 작업은 대기 | 🔧 | 작업이 사라지거나 실패 처리되면 안 된다 |
+| 25% 미만 배정 제외, 하던 일 마친 뒤 충전 | ✅ `TestBusyRobotDocksAfterItsTask`, `TestEligibility` | 구간 사이(다음 구간 ASSIGNED)에도 도크를 보내지 않음을 확인 |
+| 25% 근처에서 들어갔다 나왔다 반복하지 않음 | ✅ `TestBatteryHysteresis` (표 10줄) | 24/25/26, 표시 뒤 26·60·89는 여전히 제외, 90에서 해제, 24↔26 반복해도 이벤트 `low` 한 번 |
+| `dock` 한 번 → 10초 뒤 새 `cmd_id`로 재전송 → 3번 뒤 `dock_failed`, 1분 쉼 | ✅ `TestDockSentResentThenBacksOff` | `expires_at`, 쉬는 동안 0번, `DOCKING`/`CHARGING` 중 0번, 충전 뒤 배정까지 이벤트 순서 |
+| 충전이 중간에 끊긴 로봇은 다시 도크로 | ✅ `TestDockAgainAfterChargingStoppedEarly` | |
+| STALE·OFFLINE·IN_ELEVATOR·ERROR·IDLE인데 에러·이미 DOCKING/CHARGING·작업 없는 goto 수행 중·IDLE인데 `task_id` 보고·거둔 goto를 지켜보는 중이면 `dock` 없음 | ✅ `TestNoDockWhenRobotCannotGo` (표 9줄), `TestNoDockWhileWatched` | |
+| 위험 수준(10%)에서 작업을 돌려주고 도크로 | ✅ `TestCriticalBatteryHandsTaskBackAndDocks`, `TestCriticalHandBackWatchedAndAsked`, `TestCriticalHandBackDoneFirst` | 로봇이 멈출 때까지 작업은 그 로봇에, `cancelled`가 오면 다른 로봇. 응답 유실 시 같은 `cmd_id`로 물음. 먼저 온 `done`은 마지막 구간이면 DONE, 아니면 다음 구간을 다른 로봇에. 시도 횟수·`failed_on` 그대로, 지켜보기가 끝난 뒤에만 `dock` |
+| 위험 수준 경계·조건 | ✅ `TestCriticalThreshold`, `TestCriticalWaitsForOnline` | 10%는 그대로, 9.99%는 돌려줌. STALE 동안은 돌려주지 않고 ONLINE이 되면 돌려줌 |
+| 모든 로봇이 충전 중일 때 작업은 대기 | ✅ `TestAllRobotsChargingKeepsTasksQueued` | 5분 동안 `QUEUED`, attempts·dispatches 0, 충전 끝나면 배정 |
+| 재시작 뒤 표시 다시 계산 | ✅ `TestBatteryFlagsAfterRestart` | 25% 미만, 또는 90% 미만이면서 DOCKING/CHARGING이면 표시. IDLE 60%는 표시 안 함(알려진 한계, README) |
+| `dock` 응답은 작업 응답이 아님, `failed`여도 시간 제한까지 기다림 | ✅ `TestDockAckIgnoredByTasks` | |
+| 통합: 배터리 낮은 3대(30·35·40%, 1.5%/m, 10%/s 충전), 작업 20개 | ✅ `TestLowBatteryFleetChargesAndFinishes` (`internal/sim`) | 모두 DONE, 로봇마다 충전 1번 이상·작업 1개 이상, 표시된 동안(또는 25% 미만) 배정 0번, 겹침 검사, attempts 0. 시드 40개로 따로 돌려 모두 통과 |
+| 통합: 위험 수준까지 떨어지는 긴 작업 | ✅ `TestCriticalBatteryHandsTasksBack` (`internal/sim`) | 26~28%, 1%/m, 4구간 지그재그 작업 9개, 명령·응답 지연 50~350 ms. 돌려주기 6번(0번이면 실패), 모두 DONE, 겹침 0, attempts 0, 방전 0. 시드 40개 통과 |
+| sim 도킹 | ✅ 위 통합 테스트 | `dock`은 어댑터처럼 `accepted`, 추적 중인 goto는 `cancelled`. 자기 도크로 가서 `CHARGING`, 100%에서 `IDLE`. 배터리 0%면 `ERROR (battery_empty)` |
+| 테스트가 실제로 잡는지 | ✅ 수동 확인 | 변이 실험: 배정의 충전 필요 검사 제거, 위험 수준의 ONLINE 조건 제거, `dock`의 `task_id` 조건 제거, `<` → `<=`, 구간 보고 조건 제거, 지켜보기 중 도크 금지 제거 — 각각 적어도 한 테스트가 실패 |
+| `GET /events?since=` | ✅ `TestEventsSince` | e2e는 이것으로 이벤트를 빠짐없이 모은다 |
+| 실제 환경: 배터리 낮은 로봇이 충전하러 가고 그동안 다른 로봇이 일을 받음 | ✅ `scripts/e2e.py` 11번 (시나리오 7개 추가, 모두 31개) | 따로 띄운 `bat_1`(도크 (25,0), 30%, 3%/m, 10%/s): 4 m 작업 → 약 18% → `dock` → 충전. 그 옆 작업 2개는 다른 로봇이 받아 끝냄, 이벤트는 처음 나온 순서가 `low → dock_sent → docking → charged`(재전송 허용), 충전 뒤 다시 배정, 표시된 동안 `bat_1` 배정 0번(`since`로 모은 이벤트, 빠짐 확인). 두 번 연속 통과(약 1분 40초) |
+
+### 4단계 리뷰 (2026-11-03, 모두 수정함)
+
+리뷰어가 1~5를 실패하는 테스트(`TestR4*`)로 증명했다. 그 테스트는 `internal/task/battery_test.go`로 옮겨 고쳤다(아래 테스트 이름).
+수정 전 코드(리뷰어 사본 + 새 레지스트리 필드만)에서 새 테스트 11개가 모두 실패하고, 수정 후 통과함을 확인했다.
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 높음 | 위험 수준 돌려받기가 이미 끝난 구간(`done`이 오는 중, 로봇은 IDLE·`task_id` 없음)을 다시 대기열에 넣어 다른 로봇이 또 몬다 | 로봇이 그 구간의 `cmd_id`를 보고할 때만 돌려받는다. 게다가 작업은 로봇이 멈출 때까지 그 로봇에 남기고, 먼저 온 `done`은 그대로 처리 | `TestCriticalSkipsLegFinishedWithDoneInFlight`, `TestCriticalSkipsBetweenLegs`, `TestCriticalHandBackDoneFirst` |
+| 2 높음 | 재시작 직후 복구 확인(probe)과 같은 틱에 돌려받아, 서버가 꺼진 동안 끝난 작업을 다시 함 | 1과 같은 조건: 구간을 보고하지 않는 복구 중 작업은 probe에 맡김(보고하면 그 틱에 follow가 이미 확인함) | `TestCriticalSkipsRestoredTask` |
+| 3 중 | 표시가 풀릴 때 날아가던 `dock`이 새 goto 뒤에 도착해 goto를 `cancelled`로 끝냄 → 시도 1번, `failed_on` | `dock`을 보낸 뒤 `CmdTTL`+5초 동안은 표시와 상관없이 배정 안 함 | `TestNoTaskWhileDockMayLand` |
+| 4 중 (3단계) | 위치 전에 상태가 온 로봇을 0층 (0,0)으로 봄: 건너뛰거나, 0층 지점에 잘못 고르거나, 구간 시간 제한을 잘못 계산 | `fleet.Robot.HasPose`(첫 `pose`에서 설정). 없으면 배정 안 함("no pose yet"), 구간 시간 제한은 위치가 온 뒤 계산. e2e의 `floor == 1` 기다리기 제거 | `TestStateBeforePose` |
+| 5 중 | 상태에 `battery`가 없으면(`null` → 0) 영원히 충전 필요, 10분에 `dock` 21번 | `StateMsg.Battery`를 `*float64`로, `Robot.BatteryKnown`. 모르면 표시·도킹 안 하고 배정 대상(로그 한 번). README 문구 고침 | `TestRobotWithoutBattery` |
+| 6 낮음 | 거둔 goto가 아직 도착할 수 있는데 `dock`을 보냄 | 그 로봇을 지켜보는 동안은 `dock` 안 보냄 | `TestNoDockWhileWatched`, `TestCriticalBatteryHandsTaskBackAndDocks` |
+| 7 낮음 | 90% 전에 멈추는 충전기 → `CHARGING → IDLE` 후 다시 도크, 끝없이 반복 | 한 번은 다시 보내고, 두 번째면 25% 이상은 표시 해제(`charged`, 사유 포함), 25% 미만은 `dock_failed` 후 1분 쉼 | `TestChargerStoppingEarly` |
+| 테스트 | 변이가 살아남음: 위험 수준의 ONLINE 조건 제거, `dock`의 `task_id` 조건 제거, 10%에서 `<`→`<=` | 각각 잡는 테스트 추가 | `TestCriticalWaitsForOnline`, `TestNoDockWhenRobotCannotGo`("IDLE but reports a task_id"), `TestCriticalThreshold` |
+| 테스트 | sim 통합 테스트가 위험 수준에 닿지 않음 | 지연 + 긴 작업으로 돌려주기가 일어나는 sim 실행 추가 | `TestCriticalBatteryHandsTasksBack` |
+| e2e | 불안정 요인: 이벤트 목록을 정확히 비교, 32%−8% ≈ 24%로 여유 1%, 다른 로봇 위치에 따라 `bat_1`이 가장 가깝지 않을 수 있음, 최근 200개 안에 이벤트가 다 있어야 함 | 처음 나온 순서만 비교(재전송 허용), 30%·3%/m(≈18%), `bat_1` 도크를 (25,0)으로(앞 시나리오는 x ≤ 8), `GET /events?since=`로 이벤트를 빠짐없이 모으고 빠지면 실패 | `scripts/e2e.py`, `TestEventsSince` |
 
 ## 5단계: 대시보드 (계획)
 

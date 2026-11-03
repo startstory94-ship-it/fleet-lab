@@ -108,9 +108,9 @@ func TestRestartRules(t *testing.T) {
 
 	// Three robots each get a task, two more wait, one is finished.
 	rb.list = []fleet.Robot{
-		{Name: "a", Conn: fleet.Online, Mode: "IDLE", Floor: 1},
-		{Name: "b", Conn: fleet.Online, Mode: "IDLE", Floor: 1, X: 10},
-		{Name: "c", Conn: fleet.Online, Mode: "IDLE", Floor: 1, X: 20},
+		{Name: "a", Conn: fleet.Online, Mode: "IDLE", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true},
+		{Name: "b", Conn: fleet.Online, Mode: "IDLE", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true, X: 10},
+		{Name: "c", Conn: fleet.Online, Mode: "IDLE", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true, X: 20},
 	}
 	for _, x := range []float64{0, 10, 20, 30, 40} {
 		m.Submit([]task.Waypoint{{X: x, Floor: 1}})
@@ -135,8 +135,8 @@ func TestRestartRules(t *testing.T) {
 			t.Fatalf("restored %s = %s, want %s", id, got.State, want)
 		}
 	}
-	m.Tick()                                                 // no robots known yet: nothing happens
-	rb.list = []fleet.Robot{{Name: "b", Conn: fleet.Online}} // a pose but no state yet
+	m.Tick()                                                                // no robots known yet: nothing happens
+	rb.list = []fleet.Robot{{Name: "b", Conn: fleet.Online, HasPose: true}} // a pose but no state yet
 	m.Tick()
 	if len(s.cmds) != 0 {
 		t.Fatalf("sent %+v before any robot state was seen", s.cmds)
@@ -144,9 +144,9 @@ func TestRestartRules(t *testing.T) {
 
 	now = now.Add(time.Second)
 	rb.list = []fleet.Robot{
-		{Name: "a", Conn: fleet.Online, Mode: "MOVING", Floor: 1, TaskID: ta.CmdID},
-		{Name: "b", Conn: fleet.Online, Mode: "MOVING", Floor: 1, X: 10, TaskID: "other"},
-		{Name: "c", Conn: fleet.Online, Mode: "MOVING", Floor: 1, X: 20, TaskID: "other"},
+		{Name: "a", Conn: fleet.Online, Mode: "MOVING", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true, TaskID: ta.CmdID},
+		{Name: "b", Conn: fleet.Online, Mode: "MOVING", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true, X: 10, TaskID: "other"},
+		{Name: "c", Conn: fleet.Online, Mode: "MOVING", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true, X: 20, TaskID: "other"},
 	}
 	m.Tick()
 	if got, _ := m.Get("t-1"); got.State != task.Running || got.Robot != "a" {
@@ -175,7 +175,7 @@ func TestRestartRules(t *testing.T) {
 func TestRestoredLegFinishedWhileDown(t *testing.T) {
 	db := open(t, filepath.Join(t.TempDir(), "t.db"))
 	now := time.Date(2026, 11, 3, 9, 0, 0, 0, time.UTC)
-	rb := &robots{list: []fleet.Robot{{Name: "a", Conn: fleet.Online, Mode: "IDLE", Floor: 1}}}
+	rb := &robots{list: []fleet.Robot{{Name: "a", Conn: fleet.Online, Mode: "IDLE", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true}}}
 	m, _ := restart(t, nil, db, &now, rb)
 	m.Submit([]task.Waypoint{{X: 1, Floor: 1}})
 	m.Tick()

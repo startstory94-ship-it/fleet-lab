@@ -46,7 +46,7 @@ func get(t *testing.T, url string, v any) int {
 
 func TestRobots(t *testing.T) {
 	srv, g, _ := newServer(t)
-	g.ApplyState("robot_1", fleet.StateMsg{Boot: "b", Seq: 1, Mode: "IDLE", Battery: 50})
+	g.ApplyState("robot_1", fleet.StateMsg{Boot: "b", Seq: 1, Mode: "IDLE", Battery: ptr(50.0)})
 
 	var list []fleet.Robot
 	if code := get(t, srv.URL+"/robots", &list); code != 200 || len(list) != 1 || list[0].Name != "robot_1" {
@@ -72,6 +72,26 @@ func TestEventsLimit(t *testing.T) {
 	}
 	if get(t, srv.URL+"/events", &evs); len(evs) != 5 {
 		t.Fatalf("GET /events returned %d, want 5", len(evs))
+	}
+}
+
+func TestEventsSince(t *testing.T) {
+	srv, _, hub := newServer(t)
+	for i := 1; i <= 5; i++ {
+		hub.Publish(fleet.Event{Seq: uint64(i)})
+	}
+	var evs []fleet.Event
+	if get(t, srv.URL+"/events?since=3", &evs); len(evs) != 2 || evs[0].Seq != 4 || evs[1].Seq != 5 {
+		t.Fatalf("GET /events?since=3 = %+v", evs)
+	}
+	if code := get(t, srv.URL+"/events?since=5", &evs); code != 200 || evs == nil || len(evs) != 0 {
+		t.Fatalf("GET /events?since=5 = %d %+v, want an empty list", code, evs)
+	}
+	if get(t, srv.URL+"/events?since=0", &evs); len(evs) != 5 {
+		t.Fatalf("GET /events?since=0 returned %d, want 5", len(evs))
+	}
+	if code := get(t, srv.URL+"/events?since=x", nil); code != http.StatusBadRequest {
+		t.Fatalf("since=x = %d, want 400", code)
 	}
 }
 
@@ -109,3 +129,5 @@ func TestWebSocketStreamsEvents(t *testing.T) {
 		}
 	}
 }
+
+func ptr[T any](v T) *T { return &v }

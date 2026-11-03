@@ -69,6 +69,18 @@ func (h *Hub) Subscribe() (*Sub, func()) {
 	}
 }
 
+// Since returns the kept events numbered after seq, oldest first. If the
+// first one is not seq+1, older ones were already dropped.
+func (h *Hub) Since(seq uint64) []fleet.Event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	i := len(h.history)
+	for i > 0 && h.history[i-1].Seq > seq {
+		i--
+	}
+	return append([]fleet.Event{}, h.history[i:]...)
+}
+
 // Recent returns up to n of the latest events, oldest first.
 func (h *Hub) Recent(n int) []fleet.Event {
 	h.mu.Lock()

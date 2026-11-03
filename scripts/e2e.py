@@ -1,7 +1,8 @@
 """End-to-end scenarios: fleetd + ROS 2 mock robots + adapter + Mosquitto.
 
 Starts everything, runs each scenario against the real processes, prints
-PASS/FAIL per step and exits non-zero on any failure. Takes about two minutes.
+PASS/FAIL per step and exits non-zero on any failure. Takes under two
+minutes.
 
 Needs: Mosquitto on 127.0.0.1:1883, Go on PATH, and a shell where ROS 2 is
 set up (pixi shell + local_setup.bat). Use scripts\\e2e.bat on Windows.
@@ -116,6 +117,11 @@ def main():
         logs["fleetd2"] = open(os.path.join(tmp, "fleetd2.log"), "w")
         procs["fleetd"] = start(fleetd_cmd, logs["fleetd2"])
 
+    def start_mock(name, args):
+        """Start another mock robot process; the running adapter bridges it."""
+        logs[name] = open(os.path.join(tmp, name + ".log"), "w")
+        procs[name] = start([sys.executable, "-u", "mock_robots/mock_fleet.py"] + args, logs[name])
+
     procs = {
         "fleetd": start(fleetd_cmd, logs["fleetd"]),
         "robots": start([sys.executable, "-u", "mock_robots/mock_fleet.py", "--count", "3", "--seed", "1",
@@ -124,7 +130,7 @@ def main():
     }
     m = Mqtt()
     try:
-        run(m, procs, restart_fleetd)
+        run(m, procs, restart_fleetd, start_mock)
     finally:
         for p in procs.values():
             if p.poll() is None:
@@ -137,7 +143,7 @@ def main():
     sys.exit(1 if failed else 0)
 
 
-def run(m, procs, restart_fleetd):
+def run(m, procs, restart_fleetd, start_mock):
     names = ["robot_1", "robot_2", "robot_3"]
 
     # 1. connection
@@ -225,11 +231,122 @@ def run(m, procs, restart_fleetd):
     step("restart did not reassign running tasks", all(t.get("dispatches") == 1 for t in final),
          [(t.get("id"), t.get("dispatches"), t.get("error")) for t in final])
 
-    # 11. adapter crash -> LWT -> all OFFLINE. kill() is a hard kill (no clean
+    # 11. battery policy
+    battery_steps(start_mock)
+
+    # 12. adapter crash -> LWT -> all OFFLINE. kill() is a hard kill (no clean
     # "offline" message), so only the broker's LWT can report it.
     procs["adapter"].kill()
     step("adapter crash takes all robots OFFLINE",
          wait_for(lambda: all(robot(n)["conn"] == "OFFLINE" for n in names), 12) is not None)
+
+
+class EventTail:
+    """Collects every event after a starting seq by polling /events?since=,
+    so a busy event stream cannot push the ones we need out of the server's
+    recent-event window. gap is set if the server had already dropped some."""
+
+    def __init__(self):
+        self.cursor = max([e["seq"] for e in http_json("/events?n=1")] or [0])
+        self.events, self.gap = [], False
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while not self.stop.wait(0.2):
+            try:
+                new = http_json(f"/events?since={self.cursor}")
+            except Exception:
+                continue
+            if new and new[0]["seq"] != self.cursor + 1:
+                self.gap = True
+            if new:
+                self.events.extend(new)
+                self.cursor = new[-1]["seq"]
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+
+
+def kind(e):
+    return e.get("detail", "").split(":")[0]
+
+
+def battery_kinds(evs, name):
+    return [kind(e) for e in list(evs) if e["type"] == "battery" and e["robot"] == name]
+
+
+def first_occurrences(kinds):
+    out = []
+    for k in kinds:
+        if k not in out:
+            out.append(k)
+    return out
+
+
+def battery_steps(start_mock):
+    """bat_1 starts at 30 % and uses 3 % per metre. One 4 m task takes it to
+    about 18 %: the server docks it, it charges at 10 %/s, and other robots
+    take the tasks next to it meanwhile. Its dock is at (25, 0), far from
+    everything the earlier scenarios use (x <= 8), so bat_1 is always the
+    nearest robot to its tasks."""
+    bat, x0 = "bat_1", 25.0
+    start_mock("bat", ["--count", "1", "--prefix", "bat", "--origin-x", str(x0), "--battery", "30",
+                       "--drain-per-m", "3", "--charge-rate", "10"])
+    ok = wait_for(lambda: (robot(bat) or {}).get("conn") == "ONLINE" and robot(bat)["mode"] == "IDLE", 20)
+    step("low-battery robot bat_1 ONLINE", bool(ok), robot(bat))
+    if not ok:
+        return
+    tail = EventTail()
+    try:
+        battery_scenario(bat, x0, tail)
+    finally:
+        tail.close()
+
+
+def battery_scenario(bat, x0, tail):
+    t1 = post_json("/tasks", {"waypoints": [{"x": x0, "y": -4.0, "floor": 1}]})["id"]
+    done = wait_for(lambda: task(t1)["state"] == "DONE", 20)
+    t = task(t1) or {}
+    step("bat_1 does the task next to it", bool(done) and t.get("robot") == bat,
+         (t.get("state"), t.get("robot")))
+
+    # bat_1 is nearest but needs charge: these go to the other robots.
+    near = [post_json("/tasks", {"waypoints": [{"x": x, "y": y, "floor": 1}]})["id"]
+            for x, y in [(x0, -3.0), (x0 + 1, -4.0)]]
+    assigned = wait_for(lambda: all(task(i)["robot"] for i in near), 5)
+    who = [(task(i) or {}).get("robot") for i in near]
+    step("tasks next to a low robot go to others", bool(assigned) and bat not in who, who)
+
+    # Resends are allowed; the first occurrence of each must come in order.
+    want = ["low", "dock_sent", "docking", "charged"]
+    got = wait_for(lambda: "charged" in battery_kinds(tail.events, bat) and
+                   first_occurrences(battery_kinds(tail.events, bat)), 40)
+    step("battery events low, dock_sent, docking, charged", got == want, got)
+
+    wait_for(lambda: all(task(i)["state"] == "DONE" for i in near), 60)
+    step("other robots finished them", all((task(i) or {}).get("state") == "DONE" for i in near),
+         [((task(i) or {}).get("state"), (task(i) or {}).get("robot")) for i in near])
+
+    back = wait_for(lambda: robot(bat)["mode"] == "IDLE" and robot(bat)["battery"] >= 99, 20)
+    t2 = post_json("/tasks", {"waypoints": [{"x": x0, "y": -1.0, "floor": 1}]})["id"]
+    took = wait_for(lambda: task(t2)["robot"] == bat, 5)
+    step("charged bat_1 takes tasks again", bool(back) and bool(took), (robot(bat), task(t2)))
+    wait_for(lambda: task(t2)["state"] == "DONE", 15)
+    time.sleep(0.5)  # let the tail catch up
+
+    flagged, bad = False, []
+    for e in list(tail.events):
+        if e["robot"] != bat:
+            continue
+        if e["type"] == "battery" and kind(e) in ("low", "charged"):
+            flagged = kind(e) == "low"
+        elif e["type"] == "task" and kind(e) == "assigned" and flagged:
+            bad.append(e.get("task"))
+    step("no task assigned to bat_1 while it needed charge", not tail.gap and not bad,
+         bad or "events were dropped before they were read")
 
 
 def adapter_boot():

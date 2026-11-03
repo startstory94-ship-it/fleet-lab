@@ -48,7 +48,7 @@ func TestReviewRestartOrphanDroppedOnFirstPose(t *testing.T) {
 	h.m.LinkUp()
 	h.advance(26 * time.Second) // a never shows up; grace runs out
 	h.want(tk.ID, Queued, "")
-	h.addRobot(fleet.Robot{Name: "a", Conn: fleet.Online, Floor: 1}) // first pose, no state yet
+	h.addRobot(fleet.Robot{Name: "a", Conn: fleet.Online, Floor: 1, HasPose: true}) // first pose, no state yet
 	h.tick()
 	h.robot("a").Mode, h.robot("a").TaskID = "MOVING", tk.CmdID // state: still on the old goto
 	h.addRobot(idle("b", 9, 0))
@@ -170,7 +170,7 @@ func TestReturningRobotCancelledAfterRestart(t *testing.T) {
 
 	h.restart("b1")
 	h.m.LinkUp()
-	h.addRobot(fleet.Robot{Name: "a", Conn: fleet.Online, Mode: "MOVING", Floor: 1, TaskID: old})
+	h.addRobot(fleet.Robot{Name: "a", Conn: fleet.Online, Mode: "MOVING", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true, TaskID: old})
 	h.advance(2750 * time.Millisecond)
 	if n := cancelsTo(h, "a"); n != 0 {
 		t.Fatalf("cancelled before AckTimeout: %d", n)
@@ -227,7 +227,7 @@ func TestRestoreKeepsTaskOfUnreachableRobot(t *testing.T) {
 			tk := h.start("a", Waypoint{X: 1, Floor: 1})
 			h.restart("b1")
 			h.m.LinkUp()
-			h.addRobot(fleet.Robot{Name: "a", Conn: conn, Mode: "MOVING", Floor: 1})
+			h.addRobot(fleet.Robot{Name: "a", Conn: conn, Mode: "MOVING", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true})
 			h.advance(40 * time.Second)
 			h.want(tk.ID, Running, "a")
 			if len(h.sentTo("a")) != 0 {
@@ -243,7 +243,7 @@ func TestRestoreKeepsTaskOfUnreachableRobot(t *testing.T) {
 		tk := h.start("a", Waypoint{X: 1, Floor: 1})
 		h.restart("b1")
 		h.m.LinkUp()
-		h.addRobot(fleet.Robot{Name: "a", Conn: fleet.Stale, Mode: "MOVING", Floor: 1, TaskID: tk.CmdID})
+		h.addRobot(fleet.Robot{Name: "a", Conn: fleet.Stale, Mode: "MOVING", Floor: 1, Battery: 80, BatteryKnown: true, HasPose: true, TaskID: tk.CmdID})
 		h.tick()
 		h.robot("a").Conn = fleet.Online
 		h.advance(20 * time.Second)

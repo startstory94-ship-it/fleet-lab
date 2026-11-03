@@ -19,7 +19,6 @@ import (
 
 // Config holds the assignment and retry rules.
 type Config struct {
-	MinBattery   float64       // % a robot needs to take a task
 	FloorPenalty float64       // metres added to the distance per floor of difference
 	AckTimeout   time.Duration // wait this long for a sign of life before re-sending
 	MaxResends   int           // re-sends of the same cmd_id before the attempt fails
@@ -34,11 +33,18 @@ type Config struct {
 	Cooldown     time.Duration // a robot that ignored a goto takes no task for this long
 	LegMinSpeed  float64       // m/s; a leg times out after distance/LegMinSpeed + LegSlack
 	LegSlack     time.Duration
+
+	// Battery policy, see battery.go. Percentages.
+	LowBattery      float64       // below this a robot needs charge: no new task, dock when free
+	ResumeBattery   float64       // a robot that needs charge takes tasks again from this level
+	CriticalBattery float64       // below this a robot gives its task back and docks
+	DockTimeout     time.Duration // re-send a dock if the robot is not DOCKING after this
+	MaxDockTries    int           // docks before backing off
+	DockCooldown    time.Duration // the back-off
 }
 
 func DefaultConfig() Config {
 	return Config{
-		MinBattery:   0, // stage 4 raises this
 		FloorPenalty: 1000,
 		AckTimeout:   3 * time.Second,
 		MaxResends:   3,
@@ -50,6 +56,13 @@ func DefaultConfig() Config {
 		Cooldown:     time.Minute,
 		LegMinSpeed:  0.3,
 		LegSlack:     30 * time.Second,
+
+		LowBattery:      25,
+		ResumeBattery:   90,
+		CriticalBattery: 10,
+		DockTimeout:     10 * time.Second,
+		MaxDockTries:    3,
+		DockCooldown:    time.Minute,
 	}
 }
 
@@ -95,6 +108,9 @@ type Manager struct {
 	watches   []*watch
 	sightings map[string]sighting  // robot -> stray cmd_id it reports
 	cooldown  map[string]time.Time // robot -> takes no task until
+	charge    map[string]*charge   // robot -> battery policy state
+	noBattery map[string]bool      // robots whose state has no battery (logged once)
+	docks     int                  // dock commands sent, for their cmd_ids
 	linkUp    bool
 
 	// Persistence: the latest copy of each changed task, written by Flush.
@@ -118,7 +134,7 @@ func NewManager(cfg Config, d Deps) *Manager {
 	}
 	return &Manager{cfg: cfg, d: d, tasks: make(map[string]*Task),
 		sightings: make(map[string]sighting), cooldown: make(map[string]time.Time),
-		dirty: make(map[string]Task), wake: make(chan struct{}, 1)}
+		charge: make(map[string]*charge), noBattery: make(map[string]bool), dirty: make(map[string]Task), wake: make(chan struct{}, 1)}
 }
 
 // Restore loads tasks from the store. Call it once, before anything else.
@@ -248,7 +264,7 @@ func (m *Manager) Cancel(id string) (Task, error) {
 	if t.active() {
 		m.sendCancel(m.addWatch(t, now), now)
 	}
-	t.Finished, t.restoring = now, false
+	t.Finished, t.restoring, t.handBack = now, false, false
 	m.set(t, now, t.Robot, "cancelled", Cancelled, "cancelled by user")
 	return copyTask(t), nil
 }
@@ -258,6 +274,10 @@ func (m *Manager) Cancel(id string) (Task, error) {
 func (m *Manager) HandleAck(robot string, a Ack) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if isDock(a.CmdID) {
+		m.dockAck(robot, a)
+		return
+	}
 	t := m.tasks[taskOf(a.CmdID)]
 	if t == nil || !t.active() || t.CmdID != a.CmdID || t.Robot != robot {
 		m.d.Log.Debug("ack ignored", "robot", robot, "cmd_id", a.CmdID, "status", a.Status)
@@ -270,6 +290,10 @@ func (m *Manager) HandleAck(robot string, a Ack) {
 	case "done":
 		m.legDone(t, now)
 	case "failed", "cancelled":
+		if t.handBack {
+			m.requeue(t, now, t.Error) // stopped as asked: not the robot's failure
+			return
+		}
 		reason := a.Status
 		if a.Message != "" {
 			reason += ": " + a.Message
@@ -280,7 +304,8 @@ func (m *Manager) HandleAck(robot string, a Ack) {
 	}
 }
 
-// Tick follows running tasks, cancels stray gotos and assigns queued tasks.
+// Tick follows running tasks, applies the battery policy, cancels stray
+// gotos and assigns queued tasks.
 // Call it periodically (every 250 ms in fleetd).
 func (m *Manager) Tick() {
 	m.mu.Lock()
@@ -298,6 +323,7 @@ func (m *Manager) Tick() {
 	}
 	m.spotStrays(robots, now)
 	m.chaseWatches(byName, now)
+	m.checkBattery(robots, now)
 	m.assign(robots, now)
 }
 
@@ -305,6 +331,10 @@ func (m *Manager) Tick() {
 func (m *Manager) follow(t *Task, r *fleet.Robot, now time.Time) {
 	if t.restoring {
 		m.followRestored(t, r, now)
+		return
+	}
+	if t.handBack {
+		m.followHandBack(t, r, now)
 		return
 	}
 	paused := now.Sub(t.lastFollow)
@@ -329,11 +359,11 @@ func (m *Manager) follow(t *Task, r *fleet.Robot, now time.Time) {
 		return
 	}
 	w := t.Waypoints[t.Leg]
-	if t.legDeadline.IsZero() {
+	if t.legDeadline.IsZero() && r.HasPose {
 		d := math.Hypot(r.X-w.X, r.Y-w.Y) / m.cfg.LegMinSpeed
 		t.legDeadline = now.Add(m.cfg.LegSlack + time.Duration(d*float64(time.Second)))
 	}
-	if now.After(t.legDeadline) {
+	if !t.legDeadline.IsZero() && now.After(t.legDeadline) {
 		m.sendCancel(m.addWatch(t, now), now)
 		m.fail(t, now, fmt.Sprintf("leg %d timed out", t.Leg), false)
 		return
@@ -414,6 +444,10 @@ func (m *Manager) legDone(t *Task, now time.Time) {
 		m.set(t, now, t.Robot, "done", Done, "")
 		return
 	}
+	if t.handBack {
+		m.requeue(t, now, t.Error) // the next leg goes to another robot
+		return
+	}
 	m.newCmd(t, now)
 	m.set(t, now, t.Robot, "leg_done", Assigned, fmt.Sprintf("leg %d/%d, next %s", t.Leg, len(t.Waypoints), t.CmdID))
 	m.sendGoto(t, now)
@@ -439,7 +473,7 @@ func (m *Manager) fail(t *Task, now time.Time, reason string, watch bool) {
 
 func (m *Manager) requeue(t *Task, now time.Time, reason string) {
 	robot := t.Robot
-	t.Robot, t.CmdID, t.Error, t.restoring = "", "", reason, false
+	t.Robot, t.CmdID, t.Error, t.restoring, t.handBack = "", "", reason, false, false
 	m.set(t, now, robot, "requeued", Queued, reason)
 }
 
@@ -482,8 +516,12 @@ func (m *Manager) ineligible(r fleet.Robot, busy map[string]bool, now time.Time)
 		return "mode " + r.Mode
 	case r.Error != "":
 		return "error " + r.Error
-	case r.Battery < m.cfg.MinBattery:
-		return "battery low"
+	case !r.HasPose:
+		return "no pose yet"
+	case m.needsCharge(r):
+		return "needs charge"
+	case m.dockMayLand(r.Name, now):
+		return "a dock may still land"
 	case r.TaskID != "":
 		return "reports task " + r.TaskID
 	case busy[r.Name]:
@@ -623,7 +661,7 @@ func (m *Manager) set(t *Task, now time.Time, robot, kind, to, detail string) {
 	t.State, t.Updated = to, now
 	m.save(t)
 	m.d.Log.Info("task", "id", t.ID, "event", kind, "robot", robot, "from", from, "to", to, "detail", detail)
-	m.d.Emit(Event{Time: now, Task: t.ID, Robot: robot, Kind: kind, From: from, To: to, Detail: detail})
+	m.d.Emit(Event{Type: "task", Time: now, Task: t.ID, Robot: robot, Kind: kind, From: from, To: to, Detail: detail})
 }
 
 // save marks the task for the writer. The lock is never held across a
