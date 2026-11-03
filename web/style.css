@@ -135,3 +135,23 @@ tr.finished td { color: var(--muted); }
   font-size: 14px;
 }
 #toast button { margin-left: 10px; }
+
+/* elevators (stage 6) */
+.legend i.car { border-radius: 2px; border: 2px solid var(--elevator); background: transparent; }
+.muted { color: var(--muted); font-size: 12px; margin: 2px 0; }
+#elevators { margin-bottom: 12px; }
+.car { border: 1px solid var(--line); border-left: 4px solid var(--elevator); border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; font-size: 13px; }
+.car-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.car-id { font-weight: 700; color: var(--elevator); }
+.car-head .release { margin-left: auto; color: var(--error); border-color: var(--error); }
+.car-trip { margin: 3px 0; }
+.zone-busy { color: var(--draft); font-weight: 600; }
+.slots { list-style: none; padding: 0; margin: 4px 0; }
+.slots li { padding: 1px 0; }
+.slots li.empty { color: var(--muted); }
+.slots li.stuck { color: var(--error); font-weight: 600; }
+.slots .slot { display: inline-block; min-width: 54px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.carried { font-size: 11px; padding: 0 4px; border-radius: 3px; background: #fdecd3; color: #8a4b08; }
+.alarm { padding: 2px 6px; border-radius: 4px; margin: 3px 0; font-weight: 600; }
+.alarm.bad { background: #fde2e2; color: #9b1c1c; }
+.alarm.warn { background: #fdf0d9; color: #8a4b08; }

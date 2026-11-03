@@ -27,12 +27,17 @@ type Subscription struct {
 }
 
 type Client struct {
-	cm *autopaho.ConnectionManager
-	up chan struct{}
+	cm    *autopaho.ConnectionManager
+	up    chan struct{}
+	conns chan struct{}
 }
 
 // Up is closed when the first connection is established.
 func (c *Client) Up() <-chan struct{} { return c.up }
+
+// Connected receives a value after every (re)connection (it holds at most
+// one pending signal; a slow reader sees one for several reconnects).
+func (c *Client) Connected() <-chan struct{} { return c.conns }
 
 // Backoff returns the wait before reconnect attempt n: exponential from 1 s,
 // capped at 30 s, with ±50% jitter so many clients don't retry in lockstep.
@@ -51,6 +56,7 @@ func Connect(ctx context.Context, log *slog.Logger, brokerURL, clientID string,
 		return nil, fmt.Errorf("mqtt url: %w", err)
 	}
 	up := make(chan struct{})
+	conns := make(chan struct{}, 1)
 	var upOnce sync.Once
 	opts := make([]paho.SubscribeOptions, len(subs))
 	for i, s := range subs {
@@ -66,6 +72,10 @@ func Connect(ctx context.Context, log *slog.Logger, brokerURL, clientID string,
 		OnConnectionUp: func(cm *autopaho.ConnectionManager, _ *paho.Connack) {
 			log.Info("mqtt connected", "broker", u.Host)
 			upOnce.Do(func() { close(up) })
+			select {
+			case conns <- struct{}{}:
+			default:
+			}
 			go func() {
 				if _, err := cm.Subscribe(ctx, &paho.Subscribe{Subscriptions: opts}); err != nil {
 					log.Error("mqtt subscribe", "err", err)
@@ -91,7 +101,7 @@ func Connect(ctx context.Context, log *slog.Logger, brokerURL, clientID string,
 	if err != nil {
 		return nil, err
 	}
-	return &Client{cm: cm, up: up}, nil
+	return &Client{cm: cm, up: up, conns: conns}, nil
 }
 
 // Publish sends one message. It fails if not currently connected.

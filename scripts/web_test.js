@@ -3,7 +3,8 @@
 "use strict";
 const assert = require("node:assert/strict");
 const path = require("node:path");
-const { poseAt, gridLines, inRange, EventFeed } = require(path.join(__dirname, "..", "web", "app.js"));
+const { poseAt, gridLines, inRange, EventFeed, carSlots, ridersInCars, carBox, elevatorEvent, carAlarms } =
+  require(path.join(__dirname, "..", "web", "app.js"));
 
 let passed = 0;
 const tests = [];
@@ -185,6 +186,87 @@ test("EventFeed: a new server run id starts over even if its seq is already high
   h.feed.push(ev(1));
   assert.deepEqual(h.shown, [1, 2, 3, 1]);
   assert.equal(h.feed.reconnected(1, "run2"), false);
+});
+
+// --------------------------------------------------------------- elevators
+
+const rider = (robot, status, slot, exit, dest = exit) => ({ robot, status, slot, exit, dest, board: 2 - slot });
+const liftView = (over = {}) => ({
+  id: "E1", capacity: 3, floors: [1, 2, 3, 4, 5, 6, 7], lobby: { x: 10, y: 0 }, responding: true, waiting: [],
+  state: { floor: 5, dir: "idle", door: "open", moving: false, hold: true, trip: "E1-k3-1", load: 2, door_zone: 0 },
+  trip: { trip: "E1-k3-1", stage: "exiting", floor: 5, stops: [3, 5, 7], riders: [
+    rider("robot_2", "inside", 2, 7), rider("robot_3", "exiting", 1, 5), rider("robot_1", "out", 0, 3)],
+    lease: "2026-11-03T09:02:30Z" },
+  ...over,
+});
+const T = Date.parse("2026-11-03T09:00:40Z");
+
+test("carSlots: robots by slot from the door, out and waiting robots left out", () => {
+  const s = carSlots(liftView());
+  assert.equal(s.length, 3);
+  assert.equal(s[0], null); // robot_1 is out
+  assert.deepEqual(s[1], { robot: "robot_3", exit: 5, dest: 5, status: "exiting", carried: false });
+  assert.equal(s[2].robot, "robot_2");
+});
+test("carSlots: a carried robot is marked, a bad slot number is ignored, no trip is empty", () => {
+  const v = liftView();
+  v.trip.riders = [rider("robot_1", "inside", 0, 5, 3), rider("robot_9", "inside", 7, 5), rider("robot_8", "waiting", 1, 5)];
+  const s = carSlots(v);
+  assert.ok(s[0].carried && s[0].exit === 5 && s[0].dest === 3);
+  assert.deepEqual(s.slice(1), [null, null]);
+  assert.deepEqual(carSlots(liftView({ trip: null })), [null, null, null]);
+  assert.deepEqual(carSlots(undefined), []);
+});
+test("ridersInCars: who is drawn in which car, at the car's floor", () => {
+  const m = ridersInCars([liftView(), liftView({ id: "E2", state: null, trip: { trip: "E2-x-1", floor: 2, riders: [rider("r9", "boarding", 0, 4)] } })]);
+  assert.deepEqual([...m.keys()].sort(), ["r9", "robot_2", "robot_3"]);
+  assert.deepEqual(m.get("robot_2"), { car: "E1", slot: 2, floor: 5, status: "inside" });
+  assert.equal(m.get("r9").floor, 2); // no state yet: the trip's floor
+  for (const st of ["unsure_in", "stuck"]) {
+    const v = liftView();
+    v.trip.riders = [rider("robot_1", st, 0, 3)];
+    assert.ok(ridersInCars([v]).has("robot_1"), st);
+  }
+});
+test("carBox: door next to the lobby, slot 0 nearest the door, inside the box", () => {
+  const b = carBox({ x: 10, y: 0 }, 3);
+  assert.equal(b.x0, 11);
+  const s = [0, 1, 2].map(b.slot);
+  assert.ok(s[0].x < s[1].x && s[1].x < s[2].x);
+  for (const p of s) assert.ok(p.x > b.x0 && p.x < b.x1 && p.y > b.y0 && p.y < b.y1);
+  // same numbers as the adapter drives the robots to (fleet_logic.car_slot)
+  near(s[0].x, 11.8); near(s[2].x, 13.4);
+});
+test("elevatorEvent: kind, trip and text from the detail", () => {
+  assert.deepEqual(elevatorEvent({ detail: "overdue: E1-k3x9ab-1: car not answering at floor 5" }),
+    { kind: "overdue", trip: "E1-k3x9ab-1", text: "car not answering at floor 5" });
+  assert.deepEqual(elevatorEvent({ detail: "released" }), { kind: "released", trip: "", text: "" });
+  assert.equal(elevatorEvent({ detail: "stop: floor 3, 1 to get out" }).trip, "");
+  assert.deepEqual(elevatorEvent({}), { kind: "", trip: "", text: "" });
+});
+test("carAlarms: nothing when all is well", () => {
+  assert.deepEqual(carAlarms(liftView(), undefined, T), []);
+});
+test("carAlarms: silent car, stuck robot, blocked, lease, turn deadline, overdue of this trip only", () => {
+  const v = liftView({ responding: false });
+  v.trip.stage = "blocked";
+  v.trip.detail = "robot_2 could not get out";
+  v.trip.riders[0].status = "stuck";
+  v.trip.turn = { n: 6, robot: "robot_2", action: "exit", deadline: "2026-11-03T09:00:39Z" };
+  v.trip.lease = "2026-11-03T09:00:00Z";
+  const got = carAlarms(v, { trip: "E1-k3-1", text: "turn 6 timed out" }, T);
+  const texts = got.map((a) => a.text).join(" | ");
+  for (const want of ["응답 없음", "막힘", "robot_2 갇힘", "임대", "차례 6 시간 초과", "지연: turn 6"]) {
+    assert.ok(texts.includes(want), `${want} missing in ${texts}`);
+  }
+  assert.ok(got[0].bad);
+  assert.deepEqual(carAlarms(liftView(), { trip: "E1-old-1", text: "x" }, T), []); // another trip's overdue
+});
+test("carAlarms: two in the door zone, backoff", () => {
+  const v = liftView({ backoff_until: "2026-11-03T09:01:00Z" });
+  v.state.door_zone = 2;
+  const texts = carAlarms(v, undefined, T).map((a) => a.text);
+  assert.ok(texts.some((t) => t.includes("문 구역에 2대")) && texts.some((t) => t.includes("쉬는 중")));
 });
 
 (async () => {

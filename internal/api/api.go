@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"path"
@@ -14,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"fleetlab/internal/elevator"
 	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
 	"fleetlab/internal/live"
@@ -27,6 +29,13 @@ type Tasks interface {
 	List(state string) []task.Task
 	Get(id string) (task.Task, bool)
 	Cancel(id string) (task.Task, error)
+}
+
+// Elevators is implemented by task.Manager: the cars, their state, current
+// trip and queue, for GET /elevators, and the operator's force-release.
+type Elevators interface {
+	Elevators() []elevator.View
+	ReleaseElevator(id string) (elevator.View, error)
 }
 
 // New builds the HTTP handler. frames may be nil; /ws/live then answers 503.
@@ -48,6 +57,31 @@ func New(g *fleet.Registry, hub *events.Hub, tasks Tasks, frames *live.Broadcast
 		}
 		writeJSON(w, http.StatusOK, frames.Stats())
 	})
+	mux.HandleFunc("GET /elevators", func(w http.ResponseWriter, r *http.Request) {
+		if e, ok := tasks.(Elevators); ok {
+			writeJSON(w, http.StatusOK, e.Elevators())
+			return
+		}
+		writeJSON(w, http.StatusOK, []elevator.View{})
+	})
+	mux.HandleFunc("POST /elevators/{id}/release", sameSiteJSON(func(w http.ResponseWriter, r *http.Request) {
+		e, ok := tasks.(Elevators)
+		if !ok {
+			writeError(w, http.StatusNotFound, "unknown elevator")
+			return
+		}
+		v, err := e.ReleaseElevator(r.PathValue("id"))
+		switch {
+		case errors.Is(err, task.ErrNoElevator):
+			writeError(w, http.StatusNotFound, "unknown elevator")
+		case errors.Is(err, task.ErrNoTrip):
+			writeError(w, http.StatusConflict, "elevator has no trip to release")
+		case err != nil:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		default:
+			writeJSON(w, http.StatusOK, v)
+		}
+	}))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	})

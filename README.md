@@ -8,19 +8,21 @@ ROS 2 mock 로봇과 Go 관제 서버(fleetd)로 만드는 로봇 플릿 관제 
 | 폴더 | 내용 |
 |---|---|
 | `cmd/fleetd` | 관제 서버 진입점 |
+| `cmd/mockelevator` | MQTT mock 엘리베이터(6b): fleetd와 같은 `-elevators` 설정으로 층 이동·문·유지·`door_zone`·실패 주입 |
 | `internal/fleet` | 로봇 목록, seq 검사, 연결 상태(ONLINE/STALE/OFFLINE/IN_ELEVATOR), MQTT 메시지 수신 |
 | `internal/events` | 이벤트 배포 (느린 수신자는 건너뜀), 최근 이벤트 보관 |
 | `internal/mqttx` | MQTT 연결 (재접속 백오프 + jitter, 재구독) |
-| `internal/task` | 작업 배정·명령 재전송·재배정·취소, 배터리 정책(`battery.go`) (가짜 시계로 테스트) |
+| `internal/task` | 작업 배정·명령 재전송·재배정·취소, 배터리 정책(`battery.go`), 다른 층 구간의 엘리베이터 단계(`ride.go`) (가짜 시계로 테스트) |
+| `internal/elevator` | 엘리베이터 함께 타기: 탑승 계획(`plan.go`, 순수 함수), 운행 지휘(`car.go`: 모으기·호출·한 대씩 문·실패·임대), MQTT 메시지(`proto.go`), 설정(`config.go`). 규약은 [docs/ELEVATOR.md](docs/ELEVATOR.md) |
 | `internal/store` | 작업을 SQLite에 저장 (modernc.org/sqlite, cgo 없음) |
-| `internal/sim` | 통합 테스트용 가짜 로봇 (MQTT·ROS 없이 실제 Registry와 Manager에 연결, 배터리·도킹 포함) |
+| `internal/sim` | 통합 테스트용 가짜 로봇과 엘리베이터 (MQTT·ROS 없이 실제 Registry와 Manager에 연결, 배터리·도킹, 층·탑승·차 안 끊김·실패 주입 포함) |
 | `internal/api` | REST API, WebSocket(`/ws` 이벤트, `/ws/live` 위치 묶음), 대시보드 파일 제공 |
 | `internal/live` | 대시보드용 위치 묶음: 바뀐 로봇만 0.15초마다 한 번 만들어 모든 브라우저에 같은 바이트로, 느린 브라우저는 오래된 묶음을 버리고 전체 스냅샷으로 다시 맞춤 |
 | `web/` | 대시보드 (HTML·CSS·JS 하나씩, 빌드 없음, 외부 CDN 없음, `go:embed`로 fleetd에 들어감) |
 | `mock_robots/` | ROS 2 mock 로봇 (Gazebo 없음) |
 | `adapter/` | ROS 2 ↔ MQTT 어댑터 |
-| `docs/` | 테스트 계획과 리뷰 기록 |
-| `scripts/` | 끝단 시나리오 테스트 (`e2e.bat`), 대시보드 JS 테스트 (`web_test.js`), 데모 실행 (`demo.bat`) |
+| `docs/` | 테스트 계획과 리뷰 기록, 엘리베이터 프로토콜(`ELEVATOR.md`) |
+| `scripts/` | 끝단 시나리오 테스트 (`e2e.bat`), 대시보드 JS 테스트 (`web_test.js`), 데모 실행 (`demo.bat`, 엘리베이터 작업 `demo_tasks.ps1`) |
 
 ## 필요한 것
 
@@ -38,11 +40,14 @@ pixi shell
 call C:\pixi_ws\ros2-windows\local_setup.bat
 ```
 
-1. 관제 서버: `go run ./cmd/fleetd` (`-log debug`를 붙이면 버려진 오래된 메시지도 보인다)
-2. mock 로봇: `python mock_robots\mock_fleet.py --count 3`
+1. 관제 서버: `go run ./cmd/fleetd` (`-log debug`를 붙이면 버려진 오래된 메시지도 보인다. `-elevators <파일>`로 엘리베이터 설정, 없으면 기본 E1 하나, `-elevators none`이면 엘리베이터 없음)
+2. mock 로봇: `python mock_robots\mock_fleet.py --count 3` (`--floor`/`--floors`로 시작 층)
 3. 어댑터: `python adapter\fleet_adapter.py`
+4. mock 엘리베이터(다른 층으로 가는 작업이 있을 때): `go run ./cmd/mockelevator` (fleetd에 `-elevators <파일>`을 줬으면 같은 파일을 준다)
 
-브라우저에서 http://127.0.0.1:8080/ 을 열면 대시보드가 보인다. 한 번에 띄우려면 `scripts\demo.bat`(서버·mock 로봇 3대(`--roam-rate 2`)·어댑터를 각각 창으로 띄움, Mosquitto 필요).
+브라우저에서 http://127.0.0.1:8080/ 을 열면 대시보드가 보인다. 한 번에 띄우려면 `scripts\demo.bat`(mock 엘리베이터·서버·1층 mock 로봇 3대(`--roam-rate 2`)·9층 mock 로봇 2대(`top_1`, `top_2`)·어댑터를 각각 창으로 띄움, Mosquitto 필요).
+목적층이 다른 함께 타기를 보려면 로봇이 모두 ONLINE이 된 뒤 `powershell -ExecutionPolicy Bypass -File scripts\demo_tasks.ps1 up`(1층 3대 → 2·4·3층, 탑승 4·3·2),
+그다음 `... demo_tasks.ps1 down`(9층 2대 → 8·7층). 엘리베이터 칸과 차 안 로봇은 차가 있는 층의 지도에서 보인다.
 
 확인:
 
@@ -57,7 +62,7 @@ mosquitto_sub -t "fleet/#" -v
 mosquitto_pub -t fleet/robot_1/cmd -q 1 -m "{\"cmd_id\":\"c1\",\"type\":\"goto\",\"x\":3,\"y\":2}"
 ```
 
-명령 종류: `goto`(x, y, yaw), `cancel`, `dock`, `reset_error`, `drop_comms`. 결과는 `fleet/<robot>/cmd_ack`로 온다.
+명령 종류: `goto`(x, y, yaw), `cancel`, `dock`, `reset_error`, `drop_comms`, `rescue`(차 안 로봇을 사람이 꺼냄, mock), `ride`(엘리베이터 탑승 계획, [docs/ELEVATOR.md](docs/ELEVATOR.md)). 결과는 `fleet/<robot>/cmd_ack`로 온다.
 `goto`는 `accepted` 뒤에 `done` / `failed` / `cancelled`가 한 번 더 온다. 수행 중에는 로봇 상태의 `task_id`가 그 `cmd_id`다.
 같은 `cmd_id`를 다시 보내면 실행하지 않고 마지막 응답을 다시 보낸다.
 
@@ -70,10 +75,16 @@ node scripts\web_test.js
 scripts\e2e.bat
 ```
 
-`web_test.js`는 `web/app.js`의 DOM 없는 부분(위치 보간·외삽, 격자 선 수 제한, 이벤트 빈틈 채우기)을 Node로 시험한다(패키지 필요 없음). 화면 그리기와 클릭은 자동 테스트가 없다.
+`web_test.js`는 `web/app.js`의 DOM 없는 부분(위치 보간·외삽, 격자 선 수 제한, 이벤트 빈틈 채우기, 엘리베이터 칸·차 안 로봇·경보 계산)을 Node로 시험한다(패키지 필요 없음). 화면 그리기와 클릭은 자동 테스트가 없다.
 
-`e2e.bat`은 서버·mock 로봇·어댑터를 실제로 띄워 시나리오 35개를 돌린다(약 2분, Mosquitto 필요).
-작업 배정, 서버 재시작 후 작업 이어가기, 배터리 정책(배터리가 낮은 로봇 `bat_1`을 따로 띄움), 대시보드와 `/ws/live`도 여기서 확인한다.
+`e2e.bat`은 서버·mock 엘리베이터·mock 로봇·어댑터를 실제로 띄워 시나리오 71개를 돌린다(약 5분 반, Mosquitto 필요. 시작할 때 브로커에 남은 엘리베이터 retained 메시지를 지운다).
+작업 배정, 서버 재시작 후 작업 이어가기, 배터리 정책(배터리가 낮은 로봇 `bat_1`을 따로 띄움), 대시보드와 `/ws/live`,
+엘리베이터(1층 `lift_1..3` → 3·7·5층 함께 타기, 하차 실패 → 재시도 → 다음 층으로 넘김 → 다시 내려옴, turn 유실 + 문 지나기가 turn 시간 초과보다 느린 로봇,
+마지막 층에서 갇힘 → 운영자 반환 → 꺼냄)도 여기서 확인한다. 모든 엘리베이터 시나리오에서 엘리베이터 상태를 구독해 문 구역 최대 1대, 모든 `enter`가 문이 열리고 비어 있는 서 있는 차 뒤에 옴,
+문 구역에 로봇이 있는 채 이동한 적 없음, turn마다 `enter` 한 번, 차 안 로봇의 `fleet/*` 메시지 0개(하차 1초 뒤까지)를 확인한다.
+`scripts\e2e.bat --only elevator`는 연결 확인과 엘리베이터 시나리오만 돌린다(약 4분).
+엘리베이터의 Go 테스트: `internal/elevator`(계획 표·무작위 5,000개 성질 검사·지휘 단위 테스트), `internal/task/ride_test.go`, `internal/sim/elevator_test.go`(sim으로 실패 주입), `cmd/mockelevator`(mock 엘리베이터 동작).
+어댑터의 탑승 절차는 `adapter/test_ride_logic.py`, 어댑터 배선(가짜 ROS·MQTT)은 `adapter/test_adapter_wiring.py`(pytest).
 테스트 목록과 리뷰는 [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
 
 ## API
@@ -81,6 +92,8 @@ scripts\e2e.bat
 | 경로 | 내용 |
 |---|---|
 | `GET /robots`, `GET /robots/{name}` | 로봇 상태 (`conn` 포함) |
+| `POST /elevators/{id}/release` | 운영자 강제 반환: 차 안 로봇을 사람이 처리한 뒤 묶인 엘리베이터를 푼다. 확인 안 된 로봇의 작업은 시도 없이 대기열로(지켜보기), 탑승 전 로봇은 다시 대기. 다른 POST와 같은 JSON·사이트 규칙. 없는 엘리베이터 `404`, 운행이 없으면 `409` |
+| `GET /elevators` | 엘리베이터마다 설정(칸 수, 층, 로비), 마지막 상태(층·문·방향·유지·예약), 응답 여부, 지금 운행(단계, 로봇별 상태·칸·내릴 층, 현재 turn), 로비 대기열, 쉬는 시간. 형식은 [docs/ELEVATOR.md](docs/ELEVATOR.md) 10장 |
 | `GET /events?n=50` | 최근 이벤트 (최대 200개) |
 | `GET /events?since=<seq>` | `seq`보다 뒤의 보관 중인 이벤트. 첫 이벤트가 `seq+1`이 아니면 그 사이는 이미 버려졌다. 숫자가 아니면 `400` |
 | `GET /ws` | WebSocket 실시간 이벤트 |
@@ -126,7 +139,7 @@ scripts\e2e.bat
   상태만 오고 위치(`pose`)가 아직 없는 로봇은 층·좌표가 0으로 보이므로 배정하지 않는다(`has_pose`). 구간 시간 제한도 위치가 온 뒤에 계산한다.
 - **명령 ID:** `<작업>.<구간>.<배정 횟수>.<서버 실행 ID>` (예: `t-3.0.1.k3x9ab`). 서버 실행 ID는 시작할 때마다 새로 정하므로
   마지막 저장이 유실된 채 재시작해도 ID가 겹치지 않는다(겹치면 어댑터가 새 명령을 중복으로 보고 옛 응답을 돌려준다).
-  `expires_at`은 보낼 때마다 지금 + 10초.
+  `expires_at`은 보낼 때마다 지금 + 10초. 다른 층 구간의 엘리베이터 단계 명령은 뒤에 `.L<n>`(로비로 가는 goto), `.R<n>`(ride)이 붙는다.
 - **응답이 없으면:** 3초마다 같은 `cmd_id`로 다시 보낸다(최대 3번). 어댑터는 같은 ID를 다시 실행하지 않고 마지막 응답을 다시 보내므로,
   `done` 응답이 유실돼도 이렇게 되찾는다. 로봇이 STALE·엘리베이터 안이면 기다리는 시간을 세지 않는다.
   끝까지 답이 없는 로봇은 1분 동안 새 작업을 받지 않는다.
@@ -191,6 +204,44 @@ scripts\e2e.bat
 - **mock으로 빨리 보기:** `python mock_robots\mock_fleet.py --count 1 --prefix bat --origin-x 25 --battery 30 --drain-per-m 3 --charge-rate 10`
   (e2e가 쓰는 설정). 4 m 작업 하나로 약 18%가 되어 도크로 가고 몇 초 만에 충전된다.
 
+## 엘리베이터 (6단계)
+
+핵심 기능. 목적층이 다른 로봇을 한 엘리베이터에 함께 태운다. 메시지·시간·실패 처리·시퀀스는 **[docs/ELEVATOR.md](docs/ELEVATOR.md)** 가 기준이다(6b의 mock 로봇·어댑터·mock 엘리베이터가 이것대로 만든다).
+
+- **현업 문제:** 엘리베이터 안에서는 와이파이가 끊겨 엘리베이터 통신만 쓸 수 있었고, 목적층이 다르면 하차 순서를 정리하기 어렵고 좁은 칸에서 두 로봇이 동시에 움직이면
+  멀티로봇 회피가 깨져서, 목적층이 같은 로봇끼리만 함께 태웠다.
+- **여기서 푼 방법:** ① 탑승 전에 서버가 계획한다(`elevator.PlanTrip`, 순수 함수): 하차는 가까운 층부터, 칸 번호 = 하차 순서(0이 문 쪽), **탑승은 그 반대**.
+  그래서 어느 층에서든 내릴 로봇이 문 쪽에 있다. 같은 방향만, 칸이 모자라면 가까운 층부터 태우고 나머지는 다음 운행. ② 계획은 와이파이가 있는 로비에서 `ride` 명령으로 보내고
+  **모두 `accepted`한 뒤에만** 탑승을 시작한다. ③ **문은 한 번에 한 대:** 서버(지휘자)가 엘리베이터 채널로 한 로봇에게만 `turn`을 주고, 그 로봇이 `zone clear`/`failed`로 답하고
+  **엘리베이터가 문 구역이 비었다(`door_zone: 0`)고 알린 뒤에만** 다음 로봇에게 준다. 시간 초과(15초)는 다음 로봇을 움직이게 하지 않고 같은 로봇의 실패한 시도로 센다
+  (재시도 → 다음 층으로 넘김 → 마지막 층이면 사람 호출). 열린 turn은 5초마다 같은 번호로 다시 보내 유실을 메운다. 문이 닫혀 있으면 turn 없이 같은 층 `goto`로 다시 연다.
+  그동안 문은 `hold`로 열어 두고 마지막 로봇이 지나면 놓는다.
+- **작업과의 관계:** 지점이 다른 층인 구간은 단계로 나뉜다: 그 층 엘리베이터 로비로 `goto`(`.L<n>`) → 로비에서 대기(3초 동안 모음) → `ride`(`.R<n>`) → 내린 뒤 지점으로 `goto`.
+  작업 상태는 내내 `RUNNING`. 단계(`phase`)는 SQLite에 저장한다. 내린 층이 지점 층과 다르면(못 내려서 다음 층으로 넘겨졌거나 엉뚱한 층) 거기서 다시 계획한다.
+- **3~5단계 보장 유지:** 문을 지나기 시작한 로봇부터 차 밖으로 확인될 때까지는 지휘자가 맡는다: 끊김·OFFLINE으로 재배정하지 않고(엘리베이터 임대·경보가 대신), 배터리 위험이어도 돌려받지 않고
+  `dock`도 보내지 않는다(내린 뒤 지점으로 가는 `goto`에서 평소처럼 돌려줌). 로비에서 기다리거나 계획만 받은 로봇은 평소 규칙(응답 대기·재전송·OFFLINE·ERROR·배터리)을 따른다.
+  탑승 전 `ride`를 거둘 때는 `cancel`과 지켜보기를 쓴다. 로봇 하나에 작업 하나, 작업 하나에 로봇 하나는 그대로다.
+- **엘리베이터는 공유 자원:** 한 대에 운행은 하나. 운행마다 임대(예상 시간 + 60초). 만료되면 경보와 함께 밖으로 확인되지 않은 로봇의 작업을 다른 로봇에게 넘기고,
+  탑승 전이 아니면 **모든 로봇이 밖으로 확인되거나 운영자가 놓을 때까지**(`POST /elevators/{id}/release`) 다른 운행에 내주지 않는다.
+- **실패:** 수락 없음·엘리베이터 응답 없음(탑승 전) → 아무도 안 타고 중단, 다시 대기. 하차 실패 → 한 번 더, 또 실패하면 다음 정차층으로(뒤 로봇도 함께). 마지막 층이면 사람 호출 경보,
+  작업은 다른 로봇에게, 엘리베이터는 그 로봇이 나올 때까지 묶어 둠. 로봇이 차 안에서 쌓은 이벤트(seq + 로봇 시각)는 다시 연결되면 seq 순서로 기록.
+- **재시작:** 운행은 retained `elevator/<id>/trip`으로 이어받는다(탑승 전이었으면 안전하게 중단). 이어받은 운행은 새 실행 ID를 달고, 끝난 운행 ID는 기억해서 자기 메시지의 메아리를 다시 받지 않는다.
+  운행이 끝나면 retained 메시지를 지운다. 운행은 10초마다·MQTT 재연결 때 다시 발행하고, 발행 대기열은 운행 메시지를 버리지 않는다(실패하면 재시도). 자세히는 ELEVATOR.md 8장.
+- **이벤트:** `type: "elevator"`로 `trip_planned`, `called`, `boarding`, `boarded`, `departed`, `stop`, `exiting`, `exited`, `exit_failed`, `replanned`, `aborted`, `overdue`, `released`, `robot_event`.
+  이벤트에 `elevator` 필드(엘리베이터 ID)가 붙는다. 현재 상태는 `GET /elevators`(`/ws/live` 묶음에는 넣지 않았다. 대시보드는 1초마다와 엘리베이터 이벤트 때 읽는다).
+- **실제 프로세스(6b):** `cmd/mockelevator`가 엘리베이터 쪽(3.6·3.7: `call`/`goto`/`hold`/`release`, 같은 `cmd_id` 한 번, 층당 `floor_s`, 문 `door_s`, `hold_s` 만료,
+  `zone`의 `enter`/`clear`/`failed`로 센 `door_zone`이 0이 아니면 문을 닫지 않음, 상태 retained로 바뀔 때와 1초마다)을 한다.
+  실패 주입은 `-unresponsive E1`, `-door-blocked E1` 또는 실행 중 `mockelevator/<id>/fault`에 `{"unresponsive":true,"door_blocked":false}`.
+  어댑터(`fleet_adapter.py` + 순수 로직 `fleet_logic.RobotRide`)가 로봇 쪽(5장)을 한다: 로비에서 `ride` 수락, 엘리베이터 채널 구독, 자기 turn에만
+  `/<robot>/elevator_move`(board → 칸, floor, exit → 그 층 로비)로 mock 로봇을 움직이고 `zone`으로 답함, 탑승 turn에서 `BOARDING` + `silence_s`를 보낸 뒤
+  **내리고 1초 뒤까지 그 로봇의 `fleet/*` 발행을 모두 멈추고 명령도 받지 않음**(와이파이 끊김 흉내), 그동안의 로봇 이벤트는 쌓았다가 seq 순으로 보낸 뒤 `done`(+ 실제 층).
+  차 안 칸 위치는 로비에서 +x 쪽(문 +1.0 m, 칸 0 +1.8 m, 칸마다 0.8 m)으로 정했다. 실패 주입: mock 로봇 `--exit-fail-floor`/`--exit-fail-count`(하차 실패), `--door-move-s`(문 지나기가 turn 시간 초과보다 느림),
+  어댑터 `--ignore-turns robot_2:1`(turn 유실). 로봇이 알리지 않는 움직임은 `turn_timeout_s` + 30초(`--move-timeout-extra`) 뒤 `failed`.
+  운행이 로봇을 태운 채 끝나면(운영자 반환, retained 운행 지워짐, 60초 동안 소식 없음) 어댑터가 끊김을 끝내고 ride `failed`, 로봇은 꺼낼 때까지 ERROR("needs a human").
+  갇힌 로봇 꺼내는 운영자 절차는 ELEVATOR.md 6장.
+- **잠금:** `elevator.Car`는 잠금이 없고 작업 관리자 잠금 안에서만 불린다. 엘리베이터 채널 발행(`elevator.Link`)은 로봇 명령과 같은 발행 대기열(main의 `outbox`)로 들어가 순서가 유지되고 막히지 않는다.
+  아래 잠금 순서는 그대로다.
+
 ## 대시보드
 
 `http://127.0.0.1:8080/` (fleetd의 `-http` 주소). 파일은 `web/`에 있고 `go:embed`로 서버에 들어가므로 인터넷 없이 동작한다.
@@ -199,6 +250,11 @@ scripts\e2e.bat
   작업 목록(1초마다 + 작업 이벤트마다 새로 읽음, 진행 중 작업에 취소 버튼), 이벤트 로그(`/ws`, 최신이 위, 200개까지).
 - **지도:** 1 m 격자(축소하면 5 m). 보이는 범위는 그 층의 로봇·충전 위치·진행 중 작업 지점이 모두 들어가게 맞추고, 같은 층에 있는 동안은 넓어지기만 한다(로봇이 움직여도 화면이 흔들리지 않게).
   충전 위치는 서버가 모르므로 로봇이 `CHARGING`으로 보인 자리를 표시한다.
+- **엘리베이터(6단계):** 오른쪽 위 엘리베이터 칸마다 지금 층·방향·문(유지 여부)·문 구역 수, 운행 ID·단계·정차층·열린 차례, 칸별(0이 문 쪽) 로봇과 내릴 층(넘겨지면 "넘겨짐"),
+  밖으로 나간 로봇, 대기 로봇, 경보(응답 없음, 문 구역 2대 이상, 막힘·사람 필요, 갇힌 로봇, 임대 초과, 차례 시간 초과, 이 운행의 `overdue` 이벤트, 쉬는 중)를 보인다.
+  운행이 있으면 "강제 반환" 버튼(`confirm()` 뒤 `POST /elevators/{id}/release`, 안에 있을 수 있는 로봇 이름을 확인 창에 보임).
+  지도에는 로비 옆에 엘리베이터 칸을 그린다: 차가 있는 층이면 실선(문이 열리면 초록 문), 다른 층이면 점선과 "E1 5층". 차 안에 있을 수 있는 로봇은 마지막 위치(탑승 전 로비) 대신
+  차가 있는 층의 칸 안에 보라색으로 그린다.
 - **로봇 색:** ONLINE은 모드별(대기 회색, 이동 파랑, 도킹·충전 초록, 오류 빨강), STALE은 흐린 점선, OFFLINE은 어두운 색에 X, IN_ELEVATOR와 엘리베이터 모드는 보라.
   원 + 진행 방향 선 + 이름. 진행 중 작업은 지점(번호)과 배정된 로봇에서 다음 지점까지 선으로 그린다(대기 중 작업은 점선).
 - **조작:** 지도를 클릭하면 그 층의 그 지점으로 작업 하나를 바로 보내고, 3초 동안 "작업 t-N 보냄 [취소]" 알림을 띄운다(잘못 누른 클릭을 되돌리기 위해. 확인 창이나 보조 키보다 간단해서 이쪽을 골랐다).

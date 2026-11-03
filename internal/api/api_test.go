@@ -16,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"fleetlab/internal/elevator"
 	"fleetlab/internal/events"
 	"fleetlab/internal/fleet"
 	"fleetlab/internal/live"
@@ -353,5 +354,41 @@ func TestBootHeader(t *testing.T) {
 	c := boot(srv2.URL + "/events?n=1")
 	if a == "" || a != b || a == c {
 		t.Fatalf("boot ids %q %q (same run) %q (other run)", a, b, c)
+	}
+}
+
+type nopLift struct{}
+
+func (nopLift) Command(string, elevator.Cmd) error      { return nil }
+func (nopLift) PublishTrip(string, elevator.Trip) error { return nil }
+func (nopLift) PublishTurn(string, elevator.Turn) error { return nil }
+func (nopLift) ClearTrip(string) error                  { return nil }
+
+func TestElevators(t *testing.T) {
+	srv, _, _ := newServer(t) // no cars
+	var none []elevator.View
+	if code := get(t, srv.URL+"/elevators", &none); code != 200 || none == nil || len(none) != 0 {
+		t.Fatalf("GET /elevators without cars = %d %v, want 200 []", code, none)
+	}
+
+	hub := events.NewHub()
+	g := fleet.NewRegistry(fleet.DefaultConfig(), hub.Publish)
+	tasks := task.NewManager(task.DefaultConfig(), task.Deps{Robots: g, Sender: nopSender{},
+		Elevators: elevator.DefaultConfig(), Lift: nopLift{}})
+	tasks.HandleElevatorState("E1", elevator.State{Boot: "c", Seq: 1, Floor: 3, Door: elevator.DoorOpen})
+	srv2 := httptest.NewServer(New(g, hub, tasks, nil, slog.New(slog.NewTextHandler(io.Discard, nil))))
+	defer srv2.Close()
+	var raw []map[string]any
+	if code := get(t, srv2.URL+"/elevators", &raw); code != 200 || len(raw) != 1 {
+		t.Fatalf("GET /elevators = %d %v", code, raw)
+	}
+	e := raw[0]
+	st, _ := e["state"].(map[string]any)
+	if e["id"] != "E1" || e["capacity"] != 3.0 || e["trip"] != nil || st["floor"] != 3.0 || st["door"] != "open" ||
+		e["responding"] != true {
+		t.Fatalf("elevator %v", e)
+	}
+	if w, ok := e["waiting"].([]any); !ok || len(w) != 0 {
+		t.Fatalf("waiting %v, want []", e["waiting"])
 	}
 }

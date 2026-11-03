@@ -6,6 +6,7 @@
 //             heartbeats when nothing changes)
 //   /ws       events (connection, mode, task, battery); /events?since= fills gaps
 //   /tasks    polled every second and after every task event
+//   /elevators polled every second and after every elevator event (stage 6)
 //
 // Robots are drawn RENDER_DELAY_MS behind the server clock and interpolated
 // between the positions received, so they move smoothly although positions
@@ -144,7 +145,88 @@ class EventFeed {
   }
 }
 
-if (typeof module !== "undefined") module.exports = { poseAt, gridLines, inRange, EventFeed, MOVING_MODES };
+// ------------------------------------------------------- elevators (stage 6)
+
+// Rider statuses that may be in the car (docs/ELEVATOR.md 3.8). A boarding
+// robot is drawn in its slot: it is on its way there.
+const IN_CAR = new Set(["boarding", "inside", "unsure_in", "exiting", "stuck"]);
+// Car geometry, as the adapter drives the mock robots (adapter/fleet_logic.py):
+// the car lies along +x of its lobby, door first, slot 0 at the door.
+const CAR_DOOR_DX = 1.0, CAR_SLOT0_DX = 1.8, CAR_SLOT_DX = 0.8;
+
+// carSlots: what is in each slot of a GET /elevators entry, door (0) first.
+// null for an empty slot.
+function carSlots(view) {
+  const slots = Array.from({ length: Math.max(0, view?.capacity | 0) }, () => null);
+  for (const r of view?.trip?.riders || []) {
+    if (!IN_CAR.has(r.status) || !(r.slot >= 0 && r.slot < slots.length)) continue;
+    slots[r.slot] = { robot: r.robot, exit: r.exit, dest: r.dest, status: r.status, carried: r.exit !== r.dest };
+  }
+  return slots;
+}
+
+// ridersInCars: robot name -> {car, slot, floor, status} for every robot that
+// may be in a car. Their last pose is from before the blackout, so the map
+// draws them in the car instead.
+function ridersInCars(views) {
+  const out = new Map();
+  for (const v of views || []) {
+    const floor = v.state ? v.state.floor : v.trip?.floor;
+    for (const r of v.trip?.riders || []) {
+      if (IN_CAR.has(r.status)) out.set(r.robot, { car: v.id, slot: r.slot, floor, status: r.status });
+    }
+  }
+  return out;
+}
+
+// carBox: the car outline (metres) next to lobby, and slot i's centre.
+function carBox(lobby, capacity) {
+  const cap = Math.max(1, capacity | 0);
+  return {
+    x0: lobby.x + CAR_DOOR_DX, x1: lobby.x + CAR_SLOT0_DX + CAR_SLOT_DX * (cap - 1) + 0.6,
+    y0: lobby.y - 0.7, y1: lobby.y + 0.7,
+    slot: (i) => ({ x: lobby.x + CAR_SLOT0_DX + CAR_SLOT_DX * i, y: lobby.y }),
+  };
+}
+
+// elevatorEvent splits an event of type "elevator" ("kind: trip: text").
+function elevatorEvent(e) {
+  const d = e?.detail || "";
+  const i = d.indexOf(": ");
+  const kind = i < 0 ? d : d.slice(0, i);
+  let rest = i < 0 ? "" : d.slice(i + 2);
+  const m = /^([^\s:]+-[^\s:]+): /.exec(rest);
+  const trip = m ? m[1] : "";
+  if (m) rest = rest.slice(m[0].length);
+  return { kind, trip, text: rest };
+}
+
+// carAlarms: what needs attention, worst first ({bad, text}). overdue is the
+// last "overdue" event of the car ({trip, text}) or undefined; now in ms.
+function carAlarms(view, overdue, now) {
+  const out = [];
+  if (!view.responding) out.push({ bad: true, text: view.state ? "엘리베이터 응답 없음" : "엘리베이터 상태를 받은 적 없음" });
+  if (view.state && view.state.door_zone > 1) out.push({ bad: true, text: `문 구역에 ${view.state.door_zone}대` });
+  const t = view.trip;
+  if (t) {
+    if (t.stage === "blocked") out.push({ bad: true, text: `막힘: ${t.detail || "내리지 못한 로봇"} — 사람 필요` });
+    for (const r of t.riders || []) {
+      if (r.status === "stuck") out.push({ bad: true, text: `${r.robot} 갇힘 (${r.exit}층에서 못 내림)` });
+    }
+    if (t.lease && Date.parse(t.lease) < now) out.push({ bad: true, text: "임대 시간 초과" });
+    if (t.turn && Date.parse(t.turn.deadline) < now) {
+      out.push({ bad: false, text: `차례 ${t.turn.n} 시간 초과 (${t.turn.robot})` });
+    }
+    if (overdue && overdue.trip === t.trip) out.push({ bad: false, text: `지연: ${overdue.text}` });
+  }
+  if (view.backoff_until && Date.parse(view.backoff_until) > now) out.push({ bad: false, text: "응답 없음 뒤 쉬는 중" });
+  return out;
+}
+
+if (typeof module !== "undefined") {
+  module.exports = { poseAt, gridLines, inRange, EventFeed, MOVING_MODES,
+    carSlots, ridersInCars, carBox, elevatorEvent, carAlarms };
+}
 
 // ------------------------------------------------------------------ the page
 
@@ -158,6 +240,15 @@ const CONN_LABEL = { ONLINE: "온라인", STALE: "끊김", OFFLINE: "오프라�
 const TASK_LABEL = {
   QUEUED: "대기", ASSIGNED: "배정", RUNNING: "수행", DONE: "완료", FAILED: "실패", CANCELLED: "취소",
 };
+const STAGE_LABEL = {
+  planned: "계획(수락·호출 대기)", boarding: "탑승", travel: "이동", exiting: "하차", blocked: "막힘", done: "끝", aborted: "중단",
+};
+const RIDER_LABEL = {
+  waiting: "로비 대기", boarding: "타는 중", inside: "탐", exiting: "내리는 중", out: "내림", left: "빠짐",
+  unsure_in: "탄 것으로 봄", stuck: "갇힘",
+};
+const DOOR_LABEL = { open: "열림", closed: "닫힘", opening: "여는 중", closing: "닫는 중" };
+const DIR_MARK = { up: "▲", down: "▼", idle: "" };
 
 const state = {
   robots: new Map(), // name -> {v: latest view, track: [{t, x, y, yaw, floor}]}
@@ -170,6 +261,9 @@ const state = {
   liveSeq: 0,
   up: {},            // which -> connected; missing until the first attempt ends
   view: null,        // world -> canvas transform of the last render
+  elevators: [],     // GET /elevators
+  inCar: new Map(),  // robot -> {car, slot, floor, status}
+  overdue: new Map(), // car -> last overdue event {trip, text}
 };
 
 const $ = (id) => document.getElementById(id);
@@ -293,12 +387,13 @@ function describe(e) {
     case "battery": return `${e.robot} 배터리 ${e.detail || ""}`;
     case "adapter": return `어댑터 ${e.detail || ""}`;
     case "elevator_overdue": return `${e.robot} 엘리베이터 예정 시간 초과`;
+    case "elevator": return `${e.elevator || ""} ${e.robot ? `[${e.robot}] ` : ""}${e.detail || ""}`;
     default: return `${e.robot || ""} ${e.type} ${e.detail || ""}`;
   }
 }
 
 const TYPE_COLOR = { conn: "--moving", mode: "--idle", error: "--error", task: "--task", battery: "--charging",
-  adapter: "--offline", elevator_overdue: "--elevator", local: "--draft" };
+  adapter: "--offline", elevator_overdue: "--elevator", elevator: "--elevator", local: "--draft" };
 
 function addEvent(e) {
   const li = document.createElement("li");
@@ -314,7 +409,16 @@ const note = (text) => addEvent({ type: "local", text });
 
 const feed = new EventFeed(
   (seq) => api("GET", `/events?since=${seq}`),
-  (e) => { addEvent(e); if (e.type === "task") refreshTasksSoon(); },
+  (e) => {
+    addEvent(e);
+    if (e.type === "task") refreshTasksSoon();
+    if (e.type === "elevator") {
+      const info = elevatorEvent(e);
+      if (info.kind === "overdue") state.overdue.set(e.elevator, info);
+      if (info.kind === "released") state.overdue.delete(e.elevator);
+      refreshElevatorsSoon();
+    }
+  },
   (n) => note(`이벤트 ${n}개는 서버에서 이미 지워져 보이지 않음`),
 );
 
@@ -395,6 +499,76 @@ function renderTasks() {
     </tr>`).join("");
 }
 
+// -------------------------------------------------------------- elevators
+
+let liftTimer = null;
+function refreshElevatorsSoon() {
+  clearTimeout(liftTimer);
+  liftTimer = setTimeout(refreshElevators, 100);
+}
+
+async function refreshElevators() {
+  clearTimeout(liftTimer);
+  try {
+    state.elevators = await api("GET", "/elevators");
+    state.inCar = ridersInCars(state.elevators);
+    renderElevators();
+    renderFloors();
+  } catch (err) { /* shown by the connection badges */ }
+  liftTimer = setTimeout(refreshElevators, TASK_POLL_MS);
+}
+
+async function releaseElevator(id) {
+  const v = state.elevators.find((c) => c.id === id);
+  const inside = carSlots(v).filter(Boolean).map((s) => s.robot);
+  const warn = inside.length ? `\n안에 있을 수 있는 로봇: ${inside.join(", ")}\n사람이 꺼낸 뒤에만 반환하세요.` : "";
+  if (!confirm(`엘리베이터 ${id}를 강제로 반환할까요? 지금 운행이 끝나고 로봇들의 작업은 다시 대기열로 갑니다.${warn}`)) return;
+  try {
+    await api("POST", `/elevators/${encodeURIComponent(id)}/release`, {});
+    note(`엘리베이터 ${id} 강제 반환`);
+  } catch (err) {
+    note(`엘리베이터 ${id} 반환 실패: ${err.message}`);
+  }
+  refreshElevatorsSoon();
+}
+
+function renderElevators() {
+  const el = $("elevators");
+  const now = Date.now() + (state.clockOffset ?? 0);
+  if (!state.elevators.length) { el.innerHTML = `<p class="muted">엘리베이터 없음</p>`; return; }
+  el.innerHTML = state.elevators.map((v) => {
+    const s = v.state, t = v.trip;
+    const head = s
+      ? `<b>${esc(s.floor)}층</b> ${DIR_MARK[s.dir] || ""} · 문 ${esc(DOOR_LABEL[s.door] || s.door)}${s.hold ? " (유지)" : ""}` +
+        ` · <span class="${s.door_zone > 0 ? "zone-busy" : ""}">문 구역 ${esc(s.door_zone)}</span>${s.moving ? " · 이동 중" : ""}`
+      : "상태 없음";
+    let trip = `<div class="car-trip muted">운행 없음</div>`;
+    if (t) {
+      const turn = t.turn ? ` · 차례 #${esc(t.turn.n)} ${esc(t.turn.robot)} ${t.turn.action === "board" ? "탑승" : "하차"}` : "";
+      trip = `<div class="car-trip">${esc(t.trip)} · <b>${esc(STAGE_LABEL[t.stage] || t.stage)}</b>` +
+        `${t.stage === "travel" ? ` (${esc(t.floor)}층으로)` : t.stage === "exiting" || t.stage === "boarding" ? ` (${esc(t.floor)}층)` : ""}` +
+        ` · 정차 ${esc((t.stops || []).join("→"))}${turn}</div>`;
+    }
+    const slots = carSlots(v).map((o, i) => `<li class="${o ? o.status : "empty"}"><span class="slot">칸 ${i}${i === 0 ? " 문" : ""}</span>` +
+      (o ? `<span class="dot" style="background:var(--elevator)"></span>${esc(o.robot)} → ${esc(o.exit)}층` +
+        `${o.carried ? ` <span class="carried" title="계획 ${esc(o.dest)}층">넘겨짐</span>` : ""} <span class="state">${esc(RIDER_LABEL[o.status] || o.status)}</span>` : "비어 있음") +
+      `</li>`).join("");
+    const outside = (t?.riders || []).filter((r) => !IN_CAR.has(r.status))
+      .map((r) => `${esc(r.robot)} ${esc(RIDER_LABEL[r.status] || r.status)}${r.out_floor ? ` (${esc(r.out_floor)}층)` : ""}`).join(", ");
+    const waiting = v.waiting.map((w) => `${esc(w.robot)} ${esc(w.floor)}→${esc(w.dest)}층`).join(", ");
+    const alarms = carAlarms(v, state.overdue.get(v.id), now)
+      .map((a) => `<div class="alarm ${a.bad ? "bad" : "warn"}">${esc(a.text)}</div>`).join("");
+    return `<div class="car">
+      <div class="car-head"><span class="car-id">${esc(v.id)}</span> ${head}
+        ${t ? `<button class="release" data-release="${esc(v.id)}" title="POST /elevators/${esc(v.id)}/release">강제 반환</button>` : ""}</div>
+      ${alarms}${trip}
+      <ol class="slots">${slots}</ol>
+      ${outside ? `<div class="muted">밖: ${outside}</div>` : ""}
+      ${waiting ? `<div class="muted">대기: ${waiting}</div>` : ""}
+    </div>`;
+  }).join("");
+}
+
 // ----------------------------------------------------------------- robots
 
 function robotColor(v) {
@@ -434,6 +608,7 @@ function floorsSeen() {
   const floors = new Set();
   for (const r of state.robots.values()) if (r.v.has_pose) floors.add(r.v.floor);
   for (const t of state.tasks) if (ACTIVE.has(t.state)) for (const w of t.waypoints) floors.add(w.floor);
+  for (const v of state.elevators) if (v.state && (v.trip || v.state.door !== "closed")) floors.add(v.state.floor);
   if (state.floor !== null) floors.add(state.floor);
   return [...floors].sort((a, b) => a - b);
 }
@@ -463,6 +638,10 @@ function interestingPoints() {
   for (const r of state.robots.values()) {
     const last = r.track[r.track.length - 1];
     if (last && last.floor === state.floor) pts.push(last);
+  }
+  for (const v of state.elevators) {
+    const b = carBox(v.lobby, v.capacity);
+    pts.push(v.lobby, { x: b.x1, y: b.y1 });
   }
   for (const d of state.docks.values()) if (d.floor === state.floor) pts.push(d);
   for (const t of state.tasks) {
@@ -567,7 +746,7 @@ function drawTasks(ctx, v, poses) {
   state.draft.forEach((w, i) => drawWaypoint(ctx, v, w, String(i + 1), draft, false));
 }
 
-function drawRobot(ctx, v, r, p) {
+function drawRobot(ctx, v, r, p, labelAbove = false) {
   const [px, py] = v.toPx(p.x, p.y);
   const rad = Math.max(7, 0.35 * v.scale);
   const color = robotColor(r);
@@ -594,8 +773,43 @@ function drawRobot(ctx, v, r, p) {
   ctx.fillStyle = css("--text");
   ctx.font = "12px system-ui, sans-serif";
   ctx.textAlign = "center";
-  ctx.fillText(r.name + (r.needs_charge ? " ⚡" : ""), px, py + rad + 13);
+  ctx.fillText(r.name + (r.needs_charge ? " ⚡" : ""), px, labelAbove ? py - rad - 5 : py + rad + 13);
   ctx.textAlign = "start";
+}
+
+// drawCars draws each car next to its lobby: solid on the floor it is at
+// (with the robots that may be inside, by slot, in the elevator colour),
+// a dashed outline with its floor on the others.
+function drawCars(ctx, v) {
+  for (const car of state.elevators) {
+    const b = carBox(car.lobby, car.capacity);
+    const [x0, y0] = v.toPx(b.x0, b.y1), [x1, y1] = v.toPx(b.x1, b.y0);
+    const here = car.state && car.state.floor === state.floor;
+    const color = css("--elevator");
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.setLineDash(here ? [] : [5, 4]);
+    ctx.globalAlpha = here ? 1 : 0.5;
+    ctx.fillStyle = here ? "rgba(138, 79, 214, 0.08)" : "transparent";
+    ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    ctx.setLineDash([]);
+    // the door side
+    const open = here && car.state.door !== "closed";
+    ctx.strokeStyle = open ? css("--charging") : color; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(x0, y0 + (open ? (y1 - y0) * 0.3 : 0)); ctx.lineTo(x0, y0 + (open ? (y1 - y0) * 0.7 : y1 - y0));
+    ctx.stroke();
+    ctx.fillStyle = color; ctx.font = "bold 11px system-ui, sans-serif";
+    const s = car.state;
+    ctx.fillText(`${car.id} ${s ? `${s.floor}층${DIR_MARK[s.dir] ? " " + DIR_MARK[s.dir] : ""}` : "?"}${s && s.door_zone ? ` · 문 구역 ${s.door_zone}` : ""}`, x0, y0 - 5);
+    ctx.globalAlpha = 1;
+    if (!here) continue;
+    for (const [name, at] of state.inCar) {
+      if (at.car !== car.id) continue;
+      const r = state.robots.get(name);
+      const p = b.slot(at.slot);
+      drawRobot(ctx, v, { ...(r ? r.v : { name }), name, conn: "IN_ELEVATOR" }, { x: p.x, y: p.y, yaw: Math.PI }, at.slot % 2 === 1); // neighbours: labels above and below
+    }
+  }
 }
 
 function drawDocks(ctx, v) {
@@ -620,6 +834,7 @@ function render() {
   const v = (state.view = makeView(canvas, updateBounds()));
   drawGrid(ctx, v);
   drawDocks(ctx, v);
+  drawCars(ctx, v);
 
   const t = renderTime();
   const poses = new Map();
@@ -629,6 +844,7 @@ function render() {
   }
   drawTasks(ctx, v, poses);
   for (const [name, p] of poses) {
+    if (state.inCar.has(name)) continue; // drawn in its car
     if (p.floor === state.floor) drawRobot(ctx, v, state.robots.get(name).v, p);
   }
   requestAnimationFrame(render);
@@ -678,6 +894,10 @@ function setupInput() {
     const f = ev.target.dataset.floor;
     if (f !== undefined) selectFloor(Number(f));
   });
+  $("elevators").addEventListener("click", (ev) => {
+    const id = ev.target.dataset.release;
+    if (id) releaseElevator(id);
+  });
   for (const id of ["tasks", "toast"]) {
     $(id).addEventListener("click", (ev) => {
       const task = ev.target.dataset.cancel;
@@ -695,6 +915,7 @@ renderDraft();
 connect("/ws/live", onFrame, (up, why) => setUp("live", up, why), LIVE_SILENCE_MS);
 connect("/ws", (e) => feed.push(e), (up) => { setUp("events", up); if (up) onEventsUp(); });
 refreshTasks();
+refreshElevators();
 requestAnimationFrame(render);
 
 }
