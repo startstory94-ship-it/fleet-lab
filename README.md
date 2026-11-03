@@ -116,7 +116,7 @@ rem 9층 2대 → 8·7층
 
 | 종류 | 개수 | 어디 | 무엇을 |
 |---|---|---|---|
-| Go 전체 | 테스트 함수 207개 (아래 sim 포함, 하위 테스트까지 271개; `go test -list . ./...`, `go test -v ./...`의 `--- PASS` 줄), 몇 초 | `internal/*`, `cmd/*` | seq·연결 상태·배정·재전송·배터리·묶음·계획·지휘·API·mock 엘리베이터. 로직은 가짜 시계, HTTP/WebSocket은 `httptest` |
+| Go 전체 | 테스트 함수 208개 (아래 sim 포함, 하위 테스트까지 272개; `go test -list . ./...`, `go test -v ./...`의 `--- PASS` 줄), 몇 초 | `internal/*`, `cmd/*` | seq·연결 상태·배정·재전송·배터리·묶음·계획·지휘·API·mock 엘리베이터. 로직은 가짜 시계, HTTP/WebSocket은 `httptest` |
 | 통합 sim (Go) | 19개 | `internal/sim` | ROS·MQTT 없이 실제 `Registry`·`Manager`에 가짜 로봇·엘리베이터를 붙임. 지연·순서 뒤바뀜·응답 유실·실패 주입, 50 ms마다 "문 구역 1대·한 작업 한 로봇" 검사 |
 | 성질 (property) | 무작위 5,000개 | `internal/elevator` `TestPlanProperties` | 매 정차층에서 내릴 로봇이 모두 문 쪽, 칸 수, 방향, 결정성, 입력 순서 무관 |
 | 변이 실험 | 단계마다 수동 (6단계만 70여 개) | [TEST_PLAN](docs/TEST_PLAN.md) | 조건 하나를 일부러 깨서 적어도 한 테스트가 실패하는지 확인. 살아남은 변이는 테스트를 보강 |
