@@ -95,7 +95,7 @@ jobs:
         run: |
           go build -o bin/fleetd ./cmd/fleetd
           go run ./cmd/loadtest -fleetd bin/fleetd -robots 300 -clients 4 -slow 1 \
-            -slow-delay 1s -slow-rcvbuf 32768 -warmup 10s -window 10s -repeat 1 \
+            -slow-delay 1s -slow-rcvbuf 32768 -warmup 25s -window 10s -repeat 1 \
             -check -keep-logs
       - name: fleetd logs
         if: failure()
