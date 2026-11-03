@@ -89,13 +89,14 @@ jobs:
       # job on any WebSocket client error, on fast clients getting no frames,
       # and unless the slow client really made fleetd drop frames and send a
       # catch-up snapshot. Linux socket buffers are big, so the slow client
-      # reads one frame a second through a 32 KB receive buffer. The storm
+      # reads one frame a second through a 32 KB receive buffer (fleetd keeps
+      # its own send buffer small: api.liveSendBuffer). The storm
       # scenarios fail unless every robot reconnects and shows ONLINE again.
       - name: loadtest (small)
         run: |
           go build -o bin/fleetd ./cmd/fleetd
           go run ./cmd/loadtest -fleetd bin/fleetd -robots 300 -clients 4 -slow 1 \
-            -slow-delay 1s -slow-rcvbuf 32768 -warmup 25s -window 10s -repeat 1 \
+            -slow-delay 1s -slow-rcvbuf 32768 -warmup 10s -window 10s -repeat 1 \
             -check -keep-logs
       - name: fleetd logs
         if: failure()

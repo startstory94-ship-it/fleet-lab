@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"path"
 	"strconv"
@@ -162,6 +163,28 @@ func serveEvents(w http.ResponseWriter, r *http.Request, hub *events.Hub, writeT
 // without waiting. A variable so tests can shorten it (before New).
 var writeTimeout = 5 * time.Second
 
+// liveSendBuffer is the kernel send buffer of a /ws/live connection. Left to
+// the OS, Linux grows it to megabytes: a slow browser's frames then wait there
+// for tens of seconds, and the broadcaster never sees the client fall behind,
+// so it neither drops frames nor sends a catch-up snapshot. Kept small, the
+// socket fills within a few frames and the drop path takes over.
+const liveSendBuffer = 128 << 10
+
+type connKey struct{}
+
+// ConnContext is for http.Server.ConnContext: it keeps the connection in the
+// request context so /ws/live can shrink its send buffer.
+func ConnContext(ctx context.Context, c net.Conn) context.Context {
+	return context.WithValue(ctx, connKey{}, c)
+}
+
+// limitSendBuffer applies liveSendBuffer to the request's TCP connection and
+// reports whether it could (the server must set ConnContext).
+func limitSendBuffer(r *http.Request) bool {
+	tc, ok := r.Context().Value(connKey{}).(*net.TCPConn)
+	return ok && tc.SetWriteBuffer(liveSendBuffer) == nil
+}
+
 // serveLive streams position frames to one WebSocket client. The bytes are
 // the broadcaster's, shared with every other client; they are only written.
 // Beyond the broadcaster's subscriber limit it answers 503 before upgrading.
@@ -173,6 +196,9 @@ func serveLive(w http.ResponseWriter, r *http.Request, frames *live.Broadcaster,
 		return
 	}
 	defer unsubscribe()
+	if !limitSendBuffer(r) {
+		log.Debug("live client: send buffer left to the OS")
+	}
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return

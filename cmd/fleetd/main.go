@@ -228,7 +228,7 @@ func main() {
 	frames := live.New(liveCfg, registry, tasks)
 	go frames.Run(ctx)
 
-	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, tasks, frames, log), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: cfg.httpAddr, Handler: api.New(registry, hub, tasks, frames, log), ReadHeaderTimeout: 5 * time.Second, ConnContext: api.ConnContext}
 
 	go func() {
 		log.Info("http listening", "addr", cfg.httpAddr)
