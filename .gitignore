@@ -17,3 +17,6 @@ __pycache__/
 # Editors
 .vscode/
 .idea/
+
+# Local notes kept out of git
+docs/design-discussion.md
