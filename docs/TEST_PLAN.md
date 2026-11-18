@@ -350,6 +350,42 @@ sim 쪽에서 처음 살아남은 2개(문 구역 확인 없이 turn, turn 재�
 
 ---
 
+## 8단계: 이기종 로봇 (Unity)
+
+### 8a: MQTT로 직접 붙는 로봇 (PR #8)
+
+| 테스트 | 상태 | 리뷰 |
+|---|---|---|
+| fleetd `can_ride` (`internal/fleet/registry_test.go`, `internal/task/ride_test.go`) | ✅ 5개 | `TestCanRideDefaultsToTrue`(없음·false·true, 위치만 온 로봇, 상태를 따라 바뀜), `TestRideSkipsRobotThatCannotRide`(더 가까워도 건너뜀), `TestRideCrossFloorTaskWaitsForRider`(못 타는 로봇만 비면 대기, 뒤의 같은 층 작업은 배정, 여러 구간 작업), `TestCannotRideIgnoredWithoutElevators`, `TestRideFlagFlipAfterAssignmentRequeues`(시도 1번·`FailedOn`·이후 명령 없음·다른 로봇이 가져감). `GET /robots`에 `can_ride` |
+| Unity 로봇 프로토콜 코어 (EditMode, `Assets/Fleet/Tests`) | ✅ 41개 | `test_fleet_logic.py`의 해당 경우를 옮김: boot·seq, pose 주기·데드밴드·정지 하트비트, ack 수명주기, 같은 `cmd_id`, 만료, cancel(대상 지정), dock·배터리 |
+| 실제 fleetd 연동 (ROS 없이) | ✅ 수동 | ONLINE·`can_ride: false`, 작업 DONE, 취소 CANCELLED(goto 응답 `cancelled`), 다른 층 작업은 QUEUED로 남음, 플레이어 강제 종료 → 0.12초에 OFFLINE(LWT), 배터리 20%면 `dock` → CHARGING, 재접속 뒤 구독 복구 |
+| 혼합 플릿 (`scripts/mixed_fleet_check.py`) | ✅ 수동 PASS | ROS 로봇 3대(어댑터) + Unity 2대 + mock 엘리베이터: 같은 층 → `unity_1`, 3층 → `robot_2`(엘리베이터로 DONE, 층 3), 취소, Unity 종료 → Unity만 OFFLINE 0.02초·ROS ONLINE 유지 |
+| 회귀 | ✅ | `go test ./...`, e2e 71/71(`can_ride` 들어간 브랜치), CI 4개 잡 |
+
+### 8b: 3D 대시보드 (PR #8)
+
+| 테스트 | 상태 | 리뷰 |
+|---|---|---|
+| 묶음 처리·지도 로직 (EditMode `LiveModelTests`, `DashboardMapTests`) | ✅ 38개 (전체 79) | snapshot 교체, delta 적용, `removed` 삭제, seq 빈틈, heartbeat, 시계 차이, 기록 규칙, 주어진 시각의 보간, Go RFC3339(9자리) 시각 읽기, 칸·차 위치, 색 규칙 |
+| 실제 화면 (캡처 PNG를 직접 확인) | ✅ 수동 | 혼합 탑승: 칸별 로봇과 내릴 층, 층 사이 차, 4층 문 열림(초록)·하차. STALE(프로세스 멈춤)·OFFLINE(종료), CHARGING, 구독자 64개 꽉 참 → "server full (503)" 뒤 재연결, fleetd 멈춤 → 5초 뒤 재연결 |
+| 안 한 것 | — | 마우스 조작 실제로 안 눌러 봄(`-follow`·`-focus`만), ERROR 색은 테스트로만, WebGL 없음, CI에서 Unity 안 돎 |
+
+**8a·8b 리뷰:** 별도 리뷰는 아직 없다. 서브에이전트 결과를 diff·테스트·실제 실행으로 다시 확인했다(8c 뒤 함께 리뷰).
+
+### 8c: Unity 로봇 엘리베이터 탑승 + 대시보드 보정 (진행 중)
+
+| 테스트 | 상태 | 확인할 것 |
+|---|---|---|
+| 탑승 로직 (EditMode, `adapter/test_ride_logic.py` 34개를 옮김) | ⏳ | 수락 조건, 대기 중 새 ride, `cancel.target`, 탑승 turn의 순서(이벤트 → `BOARDING`+`silence_s` → `enter` → 이동), 같은 `n`은 같은 답, 이미 한 일의 새 `n`은 `clear`, 움직이는 중 turn 무시, 차 층 따라가기, 하차는 turn의 로비로, 1초 뒤 `pose` → `state` → 이벤트(seq 순) → `done`(+층), 하차 실패면 칸에서 기다림, 움직임 시간 초과, 운행이 로봇을 태운 채 끝남 → ERROR, 꺼냄 → `rescued` |
+| 로봇별 끊김 (EditMode, Unity 전용) | ⏳ | 한 프로세스의 로봇 하나가 끊긴 동안 그 로봇의 `fleet/*`만 0개, 다른 로봇은 계속 보냄, 끊긴 로봇이 받은 명령은 버림 |
+| Unity 로봇만 탑승 (실제 실행) | ⏳ | Unity 2대 → 3·5층: 둘 다 DONE·올바른 층, `elevator/E1/state`의 `door_zone` 최대 1, 차 안에서 `fleet/*` 0개 |
+| **ROS·Unity 함께 탑승** (실제 실행) | ⏳ | ROS 2대 + Unity 2대, 다른 층 작업 4개: `GET /elevators` 운행에 두 종류가 섞임, 계획대로 탑승 순서, 각자 층에서 하차, `door_zone` 최대 1 |
+| 하차 막힘 (실제 실행) | ⏳ | Unity 로봇 하차를 한 번 막음 → 재시도 → 다음 층 이월(ELEVATOR.md 6장), 작업 결과가 문서대로 |
+| 대시보드 보정 | ⏳ | 칸 자리 ↔ 보고된 위치 전환, 층 바뀜에서 약 0.6초 이어서 옮김, 처음 나타나는 로봇은 바로 그림. 로직이 있으면 EditMode 테스트 |
+| 회귀 | ⏳ | 기존 EditMode 79개, `mixed_fleet_check.py`(다른 층 작업도 Unity가 받을 수 있게 고침), e2e 71/71, `go test ./...`, 두 플레이어 빌드·실행 |
+| 데모 영상 | ⏳ | ROS·Unity가 한 차에 타는 3D 대시보드 영상, 타고 내릴 때 튀지 않음 |
+| 리뷰 | ⏳ | 8a~8c를 함께 리뷰(Codex 한도면 Claude 서브에이전트), 찾은 문제는 회귀 테스트와 함께 고침 |
+
 ## 리뷰에서 찾은 문제
 
 > **2026-11-03 모두 수정함.** 1·4·5는 어댑터(`adapter/fleet_logic.py`로 순수 로직 분리, `pytest` 22개),
