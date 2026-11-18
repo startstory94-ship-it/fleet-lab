@@ -56,6 +56,10 @@ func TestRobots(t *testing.T) {
 	if code := get(t, srv.URL+"/robots", &list); code != 200 || len(list) != 1 || list[0].Name != "robot_1" {
 		t.Fatalf("GET /robots = %d %+v", code, list)
 	}
+	var raw []map[string]any
+	if get(t, srv.URL+"/robots", &raw); len(raw) != 1 || raw[0]["can_ride"] != true {
+		t.Fatalf("GET /robots has no can_ride: true: %v", raw)
+	}
 	var one fleet.Robot
 	if code := get(t, srv.URL+"/robots/robot_1", &one); code != 200 || one.Battery != 50 {
 		t.Fatalf("GET /robots/robot_1 = %d %+v", code, one)

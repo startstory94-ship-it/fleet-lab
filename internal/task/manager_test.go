@@ -91,7 +91,7 @@ func (h *harness) addRobot(r fleet.Robot) {
 }
 
 func idle(name string, x, y float64) fleet.Robot {
-	return fleet.Robot{Name: name, Conn: fleet.Online, Mode: "IDLE", Battery: 80, BatteryKnown: true, HasPose: true, Floor: 1, X: x, Y: y}
+	return fleet.Robot{Name: name, Conn: fleet.Online, Mode: "IDLE", Battery: 80, BatteryKnown: true, HasPose: true, CanRide: true, Floor: 1, X: x, Y: y}
 }
 
 func (h *harness) robot(name string) *fleet.Robot { return h.robots.robots[name] }

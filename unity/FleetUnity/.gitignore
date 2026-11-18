@@ -1,0 +1,15 @@
+# Unity generates these; only Assets/, Packages/ and ProjectSettings/ are source.
+/[Ll]ibrary/
+/[Tt]emp/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+*.csproj
+*.sln
+*.slnx
+*.pidb
+*.userprefs
+.vs/
+TestResults*.xml
