@@ -1,0 +1,14 @@
+{
+    "name": "Fleet.Unity",
+    "rootNamespace": "Fleet.UnityApp",
+    "references": ["Fleet.Core"],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": ["Newtonsoft.Json.dll", "MQTTnet.dll"],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -461,7 +461,7 @@ func TestRideRestartMidTrip(t *testing.T) {
 		t.Fatalf("trip after restart %+v", tr)
 	}
 	rh.answer(elevator.ZoneClear)
-	rh.addRobot(fleet.Robot{Name: "r1", Conn: fleet.Online, Mode: "IDLE", HasPose: true, Floor: 4, Battery: 80, BatteryKnown: true})
+	rh.addRobot(fleet.Robot{Name: "r1", Conn: fleet.Online, Mode: "IDLE", HasPose: true, CanRide: true, Floor: 4, Battery: 80, BatteryKnown: true})
 	rh.ackFloor("r1", ride.CmdID, "done", 4)
 	g := rh.last("r1")
 	rh.ack("r1", g.CmdID, "done")
@@ -542,4 +542,76 @@ func TestRobotEventsRecordedInOrder(t *testing.T) {
 	if got := recorded(); got != "1,2,3,4,5,7,1" {
 		t.Fatalf("recorded %q", got)
 	}
+}
+
+func nonRider(r fleet.Robot) fleet.Robot { r.CanRide = false; return r }
+
+// A robot that cannot ride is skipped for a cross-floor task even when it is
+// the nearest; the farther robot that can ride gets it.
+func TestRideSkipsRobotThatCannotRide(t *testing.T) {
+	rh := newRideH(t, DefaultConfig(), nonRider(idle("r1", 9, 0)), idle("r2", 50, 0))
+	tk := rh.submit(Waypoint{X: 2, Y: 2, Floor: 3})
+	rh.tick()
+	rh.want(tk.ID, Assigned, "r2")
+	if n := len(rh.sentTo("r1")); n != 0 {
+		t.Fatalf("%d commands sent to the robot that cannot ride", n)
+	}
+}
+
+// With only non-riding robots free, a cross-floor task stays queued and does
+// not use up a robot: a same-floor task behind it still goes out.
+func TestRideCrossFloorTaskWaitsForRider(t *testing.T) {
+	rh := newRideH(t, DefaultConfig(), nonRider(idle("r1", 9, 0)))
+	far := rh.submit(Waypoint{X: 2, Y: 2, Floor: 3})
+	near := rh.submit(Waypoint{X: 4, Y: 4, Floor: 1})
+	rh.tick()
+	rh.want(far.ID, Queued, "")
+	rh.want(near.ID, Assigned, "r1")
+	if got := rh.task(far.ID); got.Attempts != 0 || got.State != Queued {
+		t.Fatalf("task %+v", got)
+	}
+
+	// A task whose later leg is on another floor counts too.
+	rh2 := newRideH(t, DefaultConfig(), nonRider(idle("r1", 9, 0)))
+	multi := rh2.submit(Waypoint{X: 1, Y: 1, Floor: 1}, Waypoint{X: 2, Y: 2, Floor: 3})
+	rh2.tick()
+	rh2.want(multi.ID, Queued, "")
+
+	// A rider arriving takes the waiting task.
+	rh.addRobot(idle("r2", 60, 0))
+	rh.tick()
+	rh.want(far.ID, Assigned, "r2")
+}
+
+// Without elevators nothing is held back: the flag only matters when the
+// server can ride at all.
+func TestCannotRideIgnoredWithoutElevators(t *testing.T) {
+	h := newHarness(t, DefaultConfig(), nonRider(idle("r1", 9, 0)))
+	tk := h.submit(Waypoint{X: 2, Y: 2, Floor: 3})
+	h.tick()
+	h.want(tk.ID, Assigned, "r1")
+}
+
+// A robot that stops being able to ride after it was assigned fails its own
+// attempt at the cross-floor leg (no ride is sent) and another robot takes it.
+func TestRideFlagFlipAfterAssignmentRequeues(t *testing.T) {
+	rh := newRideH(t, DefaultConfig(), idle("r1", 5, 0), idle("r2", 50, 0))
+	tk := rh.submit(Waypoint{X: 1, Y: 1, Floor: 1}, Waypoint{X: 2, Y: 2, Floor: 3})
+	rh.tick()
+	rh.want(tk.ID, Assigned, "r1")
+	g := rh.last("r1")
+	rh.ack("r1", g.CmdID, "accepted")
+	rh.robot("r1").CanRide = false
+	rh.ack("r1", g.CmdID, "done")
+
+	got := rh.want(tk.ID, Queued, "")
+	if got.Attempts != 1 || len(got.FailedOn) != 1 || got.FailedOn[0] != "r1" || !strings.Contains(got.Error, "cannot ride") {
+		t.Fatalf("task %+v", got)
+	}
+	if l := rh.last("r1"); l.Type != "goto" || l.CmdID != g.CmdID {
+		t.Fatalf("something was sent after the flip: %+v", l)
+	}
+	rh.robot("r1").Mode, rh.robot("r1").TaskID = "IDLE", ""
+	rh.tick()
+	rh.want(tk.ID, Assigned, "r2")
 }

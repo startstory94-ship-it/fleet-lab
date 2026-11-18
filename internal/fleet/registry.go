@@ -36,6 +36,10 @@ type StateMsg struct {
 	// SilenceS announces a planned blackout (e.g. riding an elevator) of up to
 	// this many seconds, counted from when the server receives the message.
 	SilenceS float64 `json:"silence_s"`
+
+	// CanRide says whether the robot can ride elevators. Missing means yes, so
+	// the ROS adapter (which never sends it) keeps working.
+	CanRide *bool `json:"can_ride,omitempty"`
 }
 
 // Connection states, judged by the server from what it receives.
@@ -94,6 +98,9 @@ type Robot struct {
 	// BatteryKnown is false when the last state carried no battery; Battery
 	// is then 0 and means nothing.
 	BatteryKnown bool `json:"battery_known"`
+	// CanRide is false only if the robot said so in its state. True until the
+	// first state: a robot known by its pose alone is assumed to ride.
+	CanRide bool `json:"can_ride"`
 
 	// LastSeen is when the server last accepted any message from this robot.
 	// It uses the server clock, so robot clock skew cannot affect liveness.
@@ -139,7 +146,7 @@ func (g *Registry) SetClock(now func() time.Time) { g.now = now }
 func (g *Registry) get(name string, now time.Time, evs []Event) (*Robot, []Event) {
 	r, ok := g.robots[name]
 	if !ok {
-		r = &Robot{Name: name, Conn: Online}
+		r = &Robot{Name: name, Conn: Online, CanRide: true}
 		g.robots[name] = r
 		evs = append(evs, Event{Time: now, Robot: name, Type: "seen"})
 	}
@@ -228,6 +235,7 @@ func (g *Registry) ApplyState(name string, m StateMsg) bool {
 		r.Host = m.Host
 	}
 	r.Mode, r.TaskID, r.Error = m.Mode, m.TaskID, m.Error
+	r.CanRide = m.CanRide == nil || *m.CanRide
 	r.Battery, r.BatteryKnown = 0, m.Battery != nil
 	if m.Battery != nil {
 		r.Battery = *m.Battery

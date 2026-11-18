@@ -220,6 +220,7 @@ ROS mock 로봇·어댑터·mock 엘리베이터·대시보드·e2e는 6b(이 �
 | 로비 `goto`(`.L`) → 대기 → `ride`(`.R`) → 지점 `goto` | ✅ `TestRideLegPhases` | 탑승 뒤 60초 무응답·OFFLINE이어도 작업 유지, 이벤트 순서 전체, 자기 retained 메아리 무시 |
 | 엘리베이터가 서지 않는 층 → FAILED, 같은 층은 그냥 goto | ✅ `TestRideNoElevatorForFloorFails` | |
 | 두 번째 구간이 다른 층 | ✅ `TestRideSecondLegOnOtherFloor` | |
+| `can_ride: false` 로봇은 다른 층 작업을 못 받음 (없으면 true, 더 가까워도 건너뜀, 자유 로봇이 그뿐이면 QUEUED로 두고 뒤의 같은 층 작업은 배정, 엘리베이터 없으면 영향 없음, 배정 뒤 false로 바뀌면 시도 1번 쓰고 재배정) | ✅ `TestCanRideDefaultsToTrue`, `TestRideSkipsRobotThatCannotRide`, `TestRideCrossFloorTaskWaitsForRider`, `TestCannotRideIgnoredWithoutElevators`, `TestRideFlagFlipAfterAssignmentRequeues` | `GET /robots`에 `can_ride`(`TestRobots`) |
 | 중단 → 같은 로비에서 다시 대기 | ✅ `TestRideAbortReturnsRobotsToTheQueue` | 옛 ride를 겨냥한 `cancel`, 시도 0, 쉰 뒤 새 `cmd_id` |
 | 수락 안 한 로봇만 책임 | ✅ `TestRideMissingAcceptBlamesThatRobotOnly` | 3초마다 재전송 |
 | 배터리 위험 | ✅ `TestRideCriticalBattery` (3가지) | 로비 대기·`planned`는 돌려줌(시도 0), 탑승 turn 뒤엔 아무 명령 없음(`dock`도), 내린 뒤 `goto`에서 돌려줌 |

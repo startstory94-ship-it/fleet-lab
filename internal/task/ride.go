@@ -66,6 +66,11 @@ func (m *Manager) prepareLeg(t *Task, floor int, now time.Time) error {
 		m.newCmd(t, now)
 		return nil
 	}
+	// pick keeps such robots off cross-floor tasks; this catches one whose
+	// can_ride turned false after it was assigned.
+	if r, ok := m.robotNow(t.Robot); ok && !r.CanRide {
+		return errCannotRide
+	}
 	c := m.carFor(floor, w.Floor)
 	if c == nil {
 		return fmt.Errorf("no elevator serves floors %d and %d", floor, w.Floor)
@@ -74,6 +79,19 @@ func (m *Manager) prepareLeg(t *Task, floor int, now time.Time) error {
 	t.Hops++
 	m.newCmd(t, now)
 	return nil
+}
+
+// errCannotRide: the robot must ride for this leg but says it cannot.
+var errCannotRide = errors.New("robot cannot ride elevators")
+
+// failLeg handles a prepareLeg error: a robot that cannot ride only spends
+// its own attempt (another robot may take the task); anything else is final.
+func (m *Manager) failLeg(t *Task, now time.Time, err error) {
+	if errors.Is(err, errCannotRide) {
+		m.fail(t, now, fmt.Sprintf("robot %s cannot ride elevators", t.Robot), false)
+		return
+	}
+	m.failForGood(t, now, err.Error())
 }
 
 // failForGood ends a task that no robot can do.
@@ -371,7 +389,7 @@ func (m *Manager) rideDone(t *Task, a Ack, now time.Time) {
 	}
 	carID := t.Elevator
 	if err := m.prepareLeg(t, floor, now); err != nil {
-		m.failForGood(t, now, err.Error())
+		m.failLeg(t, now, err)
 		return
 	}
 	m.elevEvent(carID, "replanned", t.Robot, trip,

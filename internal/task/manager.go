@@ -505,7 +505,7 @@ func (m *Manager) legDone(t *Task, now time.Time) {
 	}
 	// The robot is at the waypoint it just reached, so on its floor.
 	if err := m.prepareLeg(t, t.Waypoints[t.Leg-1].Floor, now); err != nil {
-		m.failForGood(t, now, err.Error())
+		m.failLeg(t, now, err)
 		return
 	}
 	m.set(t, now, t.Robot, "leg_done", Assigned, fmt.Sprintf("leg %d/%d, next %s", t.Leg, len(t.Waypoints), t.CmdID))
@@ -559,12 +559,15 @@ func (m *Manager) assign(robots []fleet.Robot, now time.Time) {
 			continue
 		}
 		i := m.pick(free, t)
+		if i < 0 {
+			continue // only robots that cannot do it are free; keep it queued
+		}
 		t.Robot = free[i].Name
 		floor := free[i].Floor
 		free = append(free[:i], free[i+1:]...)
 		t.Dispatches++
 		if err := m.prepareLeg(t, floor, now); err != nil {
-			m.failForGood(t, now, err.Error())
+			m.failLeg(t, now, err)
 			continue
 		}
 		m.set(t, now, t.Robot, "assigned", Assigned, t.CmdID)
@@ -597,14 +600,31 @@ func (m *Manager) ineligible(r fleet.Robot, busy map[string]bool, now time.Time)
 	return ""
 }
 
+// mustRide reports whether r would have to ride an elevator to finish t. A
+// task is only given to a robot that cannot ride if it never has to; without
+// elevators a cross-floor task fails for good whoever takes it, so nothing
+// is held back then.
+func (m *Manager) mustRide(r fleet.Robot, t *Task) bool {
+	if len(m.cars) == 0 || r.CanRide {
+		return false
+	}
+	for _, w := range t.Waypoints[t.Leg:] {
+		if w.Floor != r.Floor {
+			return true
+		}
+	}
+	return false
+}
+
 // pick chooses a robot for t: the nearest one that has not failed t, or the
-// nearest of all if every free robot has.
+// nearest of all if every free robot has. Robots that would have to ride but
+// cannot are never chosen; it returns -1 if no free robot qualifies.
 func (m *Manager) pick(free []fleet.Robot, t *Task) int {
 	w := t.Waypoints[t.Leg]
 	best, bestCost := -1, 0.0
 	for _, fresh := range []bool{true, false} {
 		for i, r := range free {
-			if fresh && slices.Contains(t.FailedOn, r.Name) {
+			if fresh && slices.Contains(t.FailedOn, r.Name) || m.mustRide(r, t) {
 				continue
 			}
 			c := math.Hypot(r.X-w.X, r.Y-w.Y) + m.cfg.FloorPenalty*math.Abs(float64(r.Floor-w.Floor))

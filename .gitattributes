@@ -3,3 +3,6 @@
 *.ps1 text eol=crlf
 *.png binary
 *.gif binary
+
+# Unity robot player (unity/FleetUnity): plugin DLLs are committed as-is
+*.dll binary
