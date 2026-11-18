@@ -77,6 +77,73 @@ namespace Fleet.Tests
             Assert.AreEqual(mid.X * (1 - 0.875), later.X, 1e-9);
         }
 
+        // ---- leaving a car: hold until the robot's first new pose ----
+
+        // Drawn in its car; REST then says "out" while its track still ends on the boarding floor.
+        static MarkerTween InCarAt(V3 slot)
+        {
+            var m = new MarkerTween();
+            m.Step(0, "t1", new V3(10, 0, 0));
+            m.Step(100, "cE1", slot);
+            m.Step(1000, "cE1", slot);
+            return m;
+        }
+
+        [Test]
+        public void HeldAfterTheCarUntilANewerPoseThenTweensFromTheHeldPosition()
+        {
+            var slot = new V3(12.6, 6, 0);
+            var m = InCarAt(slot);
+            // Out per REST at 5000 ms (server clock 105000); the track's newest sample is old.
+            Assert.IsTrue(m.HoldAfterCar(5000, 105000, 4000));
+            Near(slot, m.Last);
+            Assert.IsTrue(m.HoldAfterCar(5500, 105500, 4000), "still the pre-ride pose");
+            Assert.IsTrue(m.Holding);
+            // A pose newer than the moment it left arrives (T 105700): released.
+            Assert.IsFalse(m.HoldAfterCar(5800, 105800, 105700));
+            var lobby = new V3(10, 6, 0);                       // new floor, lobby
+            Near(slot, m.Step(5800, "t3", lobby));               // tween starts where it was held
+            Assert.IsTrue(m.Tweening);
+            Near(lobby, m.Step(5800 + MarkerTween.DurationMs, "t3", lobby));
+            Assert.IsFalse(m.HoldAfterCar(9000, 109000, 105700), "no second hold after the exit");
+        }
+
+        [Test]
+        public void HoldTimesOutAndFallsBackToTheTrack()
+        {
+            var slot = new V3(12.6, 6, 0);
+            var m = InCarAt(slot);
+            Assert.IsTrue(m.HoldAfterCar(5000, 105000, 4000));
+            Assert.IsTrue(m.HoldAfterCar(5000 + MarkerTween.HoldTimeoutMs - 1, 109999, 4000));
+            Assert.IsFalse(m.HoldAfterCar(5000 + MarkerTween.HoldTimeoutMs, 110000, 4000));
+            Assert.IsFalse(m.HoldAfterCar(11000, 111000, 4000), "stays released, even with no newer pose");
+            Near(slot, m.Step(11000, "t1", new V3(10, 0, 0)));    // tween from the held spot
+            Assert.IsTrue(m.Tweening);
+        }
+
+        [Test]
+        public void RobotThatWasNeverInACarIsNotHeld()
+        {
+            var m = new MarkerTween();
+            Assert.IsFalse(m.HoldAfterCar(0, 100000, double.NaN), "not drawn yet");
+            m.Step(0, "t1", new V3(1, 0, 0));
+            Assert.IsFalse(m.HoldAfterCar(100, 100100, 50));
+            m.Step(100, "t3", new V3(1, 6, 0));                  // a floor change on its own: no hold
+            Assert.IsFalse(m.HoldAfterCar(200, 100200, 50));
+            Assert.IsFalse(m.Holding);
+        }
+
+        [Test]
+        public void BackInTheCarEndsTheHold()
+        {
+            var slot = new V3(12.6, 6, 0);
+            var m = InCarAt(slot);
+            Assert.IsTrue(m.HoldAfterCar(5000, 105000, 4000));
+            m.Step(5100, "cE1", slot);                           // REST flickers back to "in the car"
+            Assert.IsFalse(m.Holding);
+            Assert.IsTrue(m.HoldAfterCar(6000, 106000, 4000), "a new exit holds again");
+        }
+
         [Test]
         public void EaseOutShape()
         {

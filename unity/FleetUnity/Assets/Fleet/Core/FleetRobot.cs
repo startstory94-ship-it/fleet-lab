@@ -146,6 +146,31 @@ namespace Fleet.Core
             }
         }
 
+        /// <summary>A person on site (mockrobot/&lt;robot&gt;/operator, {"action":"reset_error"|"rescue"}),
+        /// the mock's local reset_error and rescue services. Works in the blackout too and
+        /// never acks: it is not a fleet command. Tick carries on what it changes.</summary>
+        public void HandleOperator(string payload, double wall)
+        {
+            lastWall = wall;
+            string action;
+            try { action = (JToken.Parse(payload) as JObject)?.Value<string>("action"); }
+            catch (Exception e) when (e is JsonException || e is FormatException || e is InvalidCastException)
+            {
+                Log($"{Name}: bad operator message: {Trunc(payload)}");
+                return;
+            }
+            string no;
+            switch (action)
+            {
+                case "reset_error": no = Sim.ResetError(); break;
+                case "rescue": no = Sim.Rescue(); break;
+                default:
+                    Log($"{Name}: unknown operator action: {Trunc(payload)}");
+                    return;
+            }
+            Log($"{Name}: operator {action}: {no ?? "done"}");
+        }
+
         void DoRide(JObject cmd, string cmdId, double now, double wall, List<Outgoing> outq)
         {
             var acts = Ride.Accept(cmdId, cmd["ride"] as JObject, RideState(), new Spot(Sim.X, Sim.Y), now);

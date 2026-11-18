@@ -7,7 +7,9 @@
 // car; FleetBootstrap routes each message to the robots riding that car).
 // MQTTnet runs on thread-pool threads; incoming messages go
 // to an inbox the main thread drains, and outgoing ones leave through one
-// sender task so acks and seq keep their order.
+// sender task so acks and seq keep their order. While the link is down QoS 1
+// messages wait in a PendingQueue (like paho's) and go out in order once it is
+// back and subscribed; QoS 0 (pose) is dropped.
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -35,10 +37,14 @@ namespace Fleet.UnityApp
         readonly MqttClientOptions options;
         readonly ConcurrentQueue<KeyValuePair<string, string>> inbox = new ConcurrentQueue<KeyValuePair<string, string>>();
         readonly BlockingCollection<Outgoing> outbox = new BlockingCollection<Outgoing>(4096);
+        readonly PendingQueue pending = new PendingQueue();
         readonly CancellationTokenSource stop = new CancellationTokenSource();
         readonly System.Random rng = new System.Random();
         int connects;        // bumped on each successful connect; the main thread re-publishes on change
         int dropped;
+        // True from "online" + subscribe done until the link drops. IsConnected is true
+        // earlier, and sending then would let new messages pass the status and the resubscribe.
+        volatile bool ready;
 
         public FleetMqtt(string brokerHost, int brokerPort, string host, IEnumerable<string> robots,
                          IEnumerable<string> extraTopics = null)
@@ -74,6 +80,7 @@ namespace Fleet.UnityApp
             };
             client.DisconnectedAsync += e =>
             {
+                ready = false;
                 if (!stop.IsCancellationRequested)
                     Log($"mqtt disconnected: {e.Reason} {e.Exception?.Message}");
                 return Task.CompletedTask;
@@ -82,7 +89,8 @@ namespace Fleet.UnityApp
 
         public bool IsConnected => client.IsConnected;
         public int Connects => Volatile.Read(ref connects);
-        public int Dropped => Volatile.Read(ref dropped);
+        public int Dropped => Volatile.Read(ref dropped) + Volatile.Read(ref pendingDropped);
+        int pendingDropped;
 
         public void Start()
         {
@@ -102,8 +110,8 @@ namespace Fleet.UnityApp
             return false;
         }
 
-        /// <summary>Queue for sending. Dropped while disconnected, as fleetd re-sends
-        /// commands and robots repeat pose/state every second anyway.</summary>
+        /// <summary>Queue for sending. While disconnected QoS 1 messages are kept (bounded,
+        /// oldest dropped) and sent in order after reconnecting; QoS 0 is dropped.</summary>
         public void Send(Outgoing o)
         {
             if (stop.IsCancellationRequested || !outbox.TryAdd(o))
@@ -128,6 +136,7 @@ namespace Fleet.UnityApp
                         foreach (var t in cmdTopics)
                             sub.WithTopicFilter(t, MqttQualityOfServiceLevel.AtLeastOnce);
                         await client.SubscribeAsync(sub.Build(), stop.Token);
+                        ready = true;
                         Interlocked.Increment(ref connects);
                         Log($"mqtt connected to {brokerHost}:{brokerPort} as host {Host} (boot {Boot}), {string.Join(", ", cmdTopics)}");
                         delay = 0.5 + rng.NextDouble();
@@ -138,6 +147,7 @@ namespace Fleet.UnityApp
                     }
                     catch (Exception e)
                     {
+                        ready = false;
                         // Connected but "online" or the subscribe failed: drop the link so the
                         // next pass redoes the whole sequence instead of seeing IsConnected.
                         if (client.IsConnected)
@@ -157,24 +167,27 @@ namespace Fleet.UnityApp
 
         async Task SendLoop()
         {
+            bool failed = false;
             try
             {
-                foreach (var o in outbox.GetConsumingEnumerable(stop.Token))
+                while (!stop.IsCancellationRequested)
                 {
-                    if (!client.IsConnected)
+                    // Wait for news only when there is nothing to flush right now; a failed
+                    // publish waits too, so a dead link is not retried in a hot loop.
+                    int wait = pending.Count > 0 && ready && !failed ? 0 : 100;
+                    if (outbox.TryTake(out var o, wait, stop.Token))
                     {
-                        Interlocked.Increment(ref dropped);
-                        continue;
+                        pending.Enqueue(o, ready);
+                        while (outbox.TryTake(out o)) pending.Enqueue(o, ready);
                     }
-                    try { await Publish(o.Topic, o.Payload, o.Qos, o.Retain); }
-                    catch (Exception e) when (!(e is OperationCanceledException))
-                    {
-                        Interlocked.Increment(ref dropped);
-                        Log($"publish {o.Topic} failed: {e.Message}");
-                    }
+                    failed = false;
+                    await pending.FlushAsync(() => ready, m => Publish(m.Topic, m.Payload, m.Qos, m.Retain),
+                        (m, e) => { failed = true; Log($"publish {m.Topic} failed: {e.Message}"); }).ConfigureAwait(false);
+                    Volatile.Write(ref pendingDropped, pending.Dropped);
                 }
             }
             catch (OperationCanceledException) { }
+            catch (InvalidOperationException) { } // outbox completed by Dispose
         }
 
         Task Publish(string topic, string payload, int qos, bool retain)

@@ -324,6 +324,84 @@ namespace Fleet.Tests
             Assert.AreEqual("WAITING_ELEVATOR", (string)Take("fleet/unity_1/state").Last()["mode"]);
         }
 
+        // ---- operator topic (mockrobot/<robot>/operator): a person on site, works in the blackout ----
+
+        const string ResetError = "{\"action\":\"reset_error\"}";
+        const string Rescue = "{\"action\":\"rescue\"}";
+
+        [Test]
+        public void OperatorResetErrorUnblocksAFaultInTheDoorZoneDuringTheBlackout()
+        {
+            Cmd(a, RideCmd("R1", "unity_1"));
+            Elev("turn", Turn(1, "unity_1", "board", 1));
+            Run(0.5);
+            a.Sim.Fail("simulated_fault");
+            Run(1);
+            Assert.IsTrue(a.Ride.Silent);
+            Cmd(a, "{\"cmd_id\":\"rst\",\"type\":\"reset_error\"}"); // a fleet command never gets through
+            Assert.AreEqual("ERROR", a.Sim.Mode);
+            outq.Clear();
+            a.HandleOperator(ResetError, wall);
+            Assert.IsEmpty(outq, "no ack on fleet/* for operator actions");
+            var failed = RunUntil("elevator/E1/zone", z => (string)z["event"] == "failed");
+            StringAssert.Contains("fault in the door zone", (string)failed["reason"]);
+            Assert.AreEqual(10.0, a.Sim.X, 1e-9, "pushed back to the lobby");
+            Assert.AreEqual("IDLE", a.Sim.Mode);
+            Assert.IsFalse(a.Ride.Silent);
+            Assert.AreEqual("WAITING_ELEVATOR", (string)Take("fleet/unity_1/state").Last()["mode"]);
+        }
+
+        [Test]
+        public void OperatorRescueTakesARobotOutOfTheCarWhileRiding()
+        {
+            AcceptAndBoard(a);
+            Elev("state", CarState(3));
+            Run(0.2);
+            Assert.IsTrue(a.Ride.Silent);
+            a.HandleOperator(Rescue, wall);
+            Assert.IsEmpty(outq, "no ack on fleet/* for operator actions");
+            Assert.IsFalse(a.Sim.InCar);
+            Assert.AreEqual(3, a.Sim.Floor);
+            var ev = RunUntil("fleet/unity_1/event", e => (string)e["event"] == "rescued");
+            Assert.AreEqual(3, (int)ev["floor"]);
+            Assert.IsFalse(a.Ride.Silent);
+            Assert.AreEqual("IDLE", (string)Take("fleet/unity_1/state").Last()["mode"]);
+        }
+
+        [Test]
+        public void OperatorRescueOfAStrandedRobotReportsRescued()
+        {
+            AcceptAndBoard(a);
+            Elev("state", CarState(4));
+            Run(0.1);
+            Elev("trip", null);          // the trip ended with the robot inside: link back, ERROR "needs a human"
+            Run(1.2);
+            Assert.AreEqual("E1", a.Ride.Stranded);
+            outq.Clear();
+            a.HandleOperator(Rescue, wall);
+            Assert.IsEmpty(outq);
+            Run(0.1);
+            Assert.AreEqual("rescued", (string)Take("fleet/unity_1/event").Single()["event"]);
+            Assert.AreEqual("", a.Ride.Stranded);
+            Assert.AreEqual(4, a.Sim.Floor);
+        }
+
+        [Test]
+        public void OperatorMessagesThatDoNothingStaySilent()
+        {
+            a.HandleOperator(Rescue, wall);                 // not in a car
+            a.HandleOperator(ResetError, wall);             // not in ERROR
+            a.HandleOperator("{\"action\":\"explode\"}", wall);
+            a.HandleOperator("not json", wall);
+            a.HandleOperator("[1]", wall);
+            Assert.IsEmpty(outq);
+            Assert.AreEqual("IDLE", a.Sim.Mode);
+            Assert.AreEqual("unity_1", Topics.RobotOfOperator("mockrobot/unity_1/operator"));
+            Assert.IsNull(Topics.RobotOfOperator("mockrobot/unity_1/fault"));
+            Assert.IsNull(Topics.RobotOfOperator("fleet/unity_1/operator"));
+            Assert.IsNull(Topics.RobotOfOperator("mockrobot//operator"));
+        }
+
         // ---- can_ride false ----
 
         [Test]

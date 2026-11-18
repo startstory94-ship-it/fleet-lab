@@ -370,7 +370,7 @@ sim 쪽에서 처음 살아남은 2개(문 구역 확인 없이 turn, turn 재�
 | 실제 화면 (캡처 PNG를 직접 확인) | ✅ 수동 | 혼합 탑승: 칸별 로봇과 내릴 층, 층 사이 차, 4층 문 열림(초록)·하차. STALE(프로세스 멈춤)·OFFLINE(종료), CHARGING, 구독자 64개 꽉 참 → "server full (503)" 뒤 재연결, fleetd 멈춤 → 5초 뒤 재연결 |
 | 안 한 것 | — | 마우스 조작 실제로 안 눌러 봄(`-follow`·`-focus`만), ERROR 색은 테스트로만, WebGL 없음, CI에서 Unity 안 돎 |
 
-**8a·8b 리뷰:** 별도 리뷰는 아직 없다. 서브에이전트 결과를 diff·테스트·실제 실행으로 다시 확인했다(8c와 함께 리뷰할 차례).
+**8a·8b 리뷰:** 8c와 함께 리뷰했다(아래 8단계 리뷰).
 
 ### 8c: Unity 로봇 엘리베이터 탑승 + 대시보드 보정
 
@@ -386,7 +386,19 @@ sim 쪽에서 처음 살아남은 2개(문 구역 확인 없이 turn, turn 재�
 | 혼합 검증 스크립트 | ✅ PASS 2가지 | 기본: 다른 층 작업을 Unity도 받음(`unity_2` 5층). `--unity-no-ride`(`-canRide false`): ROS만 탐 |
 | 회귀 | ✅ | e2e 71/71, 두 플레이어 빌드·실행. fleetd·어댑터·mock·2D 대시보드는 바꾸지 않음 |
 | 데모 영상 | ✅ | 함께 타는 3D 대시보드 영상(약 2배속, 51초) |
-| 리뷰 | ⏳ | 8a~8c를 함께 리뷰할 차례 |
+| 리뷰 | ✅ | 아래 8단계 리뷰 |
+
+### 8단계 리뷰 (2026-11-19, Codex, 8a~8c 전체 `3a23203..`, 모두 수정함)
+
+지적 3개를 코드에서 확인했고 모두 맞았다. 각 수정에 회귀 테스트를 넣고, 수정을 끈 채 한 번 돌려 실패하는지 확인했다(10개 실패, 나머지 4개는 아무것도 안 하는 경우·경계 확인이라 양쪽 다 통과). EditMode 156/156.
+
+| # | 문제 | 수정 | 테스트 |
+|---|---|---|---|
+| 1 중 | MQTT가 끊긴 동안 Unity 로봇은 QoS 1도 버림. 하차 직후 와이파이 복귀와 MQTT 끊김이 겹치면 `boarded`·`exited` 이벤트를 영영 잃음. ROS 어댑터(paho)는 끊긴 동안의 QoS 1을 붙잡았다가 다시 연결되면 순서대로 보냄 | `Core/PendingQueue.cs`(순서 유지, 최대 1000개, 넘치면 가장 오래된 것을 버리고 셈). 끊긴 동안·발행 실패 뒤 QoS 1을 쌓고, "online" 발행과 구독이 끝난 뒤(`ready`) 새 메시지보다 먼저 보냄. QoS 0(pose)은 버림 | `PendingQueueTests` 6개: 순서·새것보다 먼저, QoS 0 버림, 한도, 실패한 발행은 맨 앞에 남고 멈춤, 실패한 QoS 0, 도중에 끊김. 실제 재연결 확인은 결론을 못 냄(새 구독자가 본 seq가 건너뜀): 단위 테스트에 기댐 |
+| 2 중 | 문 구역에서 고장(ERROR)이 나면 움직임은 `running`, 끊김 유지, `reset_error`·`rescue` 명령은 차 안이라 버려짐 → 실행 중인 플레이어로는 풀 수 없음. ROS mock 로봇은 로컬 서비스(현장 사람)가 있음 | 운영자 토픽 `mockrobot/<robot>/operator`(`{"action":"reset_error"}` / `{"action":"rescue"}`), `fleet/*`이 아니므로 끊긴 동안에도 받음(mock 엘리베이터의 `mockelevator/<id>/fault`와 같은 성격). `fleet/*` 응답 없음. ROBOT_PROTOCOL.md 9.1에 적음 | `OperatorResetErrorUnblocksAFaultInTheDoorZoneDuringTheBlackout`, `OperatorRescueTakesARobotOutOfTheCarWhileRiding`, `OperatorRescueOfAStrandedRobotReportsRescued`, `OperatorMessagesThatDoNothingStaySilent` |
+| 3 낮 | 대시보드: 하차하면 `/elevators`는 곧 `out`인데 새 pose는 규약상 1초 뒤. 그 사이 탑승 전 층의 기록을 써서 마커가 출발 층 쪽으로 갔다가 하차 층으로 튐(8c 보정이 오히려 눈에 띄게 함) | 차에서 나온 로봇은 그 뒤의 pose가 올 때까지 마지막으로 그린 자리에 둠(최대 5초, 넘으면 기록 사용), 그 뒤 0.6초 보정으로 새 위치로 | `HeldAfterTheCarUntilANewerPoseThenTweensFromTheHeldPosition`, `HoldTimesOutAndFallsBackToTheTrack`, `BackInTheCarEndsTheHold`, `RobotThatWasNeverInACarIsNotHeld`. 실제 캡처에서 하차 뒤 1층 로비에 나타나지 않음 |
+
+**남은 한계:** 3번은 `out`을 본 서버 시각보다 새 pose 샘플을 기다린다. 폴링이 `out`을 보기 전에 pose가 먼저 오고 로봇이 그 뒤 멈춰 있으면 5초 동안 붙잡혀 있다가 기록으로 돌아간다.
 
 ## 리뷰에서 찾은 문제
 

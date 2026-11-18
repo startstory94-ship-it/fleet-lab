@@ -40,6 +40,10 @@ namespace Fleet.Core
         public static string Event(string robot) => $"fleet/{robot}/event";
         public static string Zone(string car) => $"elevator/{car}/zone";
 
+        /// <summary>A person on site, not the fleet: mockrobot/&lt;robot&gt;/operator, like the
+        /// mock elevator's mockelevator/&lt;id&gt;/fault. Works while the robot is in the car and silent.</summary>
+        public const string OperatorFilter = "mockrobot/+/operator";
+
         /// <summary>What a riding robot follows (docs/ELEVATOR.md 2), subscribed with
         /// a wildcard so one connection serves every robot and every car.</summary>
         public static readonly string[] ElevatorFollow = { "elevator/+/turn", "elevator/+/state", "elevator/+/trip" };
@@ -69,6 +73,13 @@ namespace Fleet.Core
             }
             catch (Newtonsoft.Json.JsonException) { return false; }
             return msg != null;
+        }
+
+        /// <summary>The robot of a mockrobot/&lt;robot&gt;/operator topic, or null.</summary>
+        public static string RobotOfOperator(string topic)
+        {
+            var p = topic.Split('/');
+            return p.Length == 3 && p[0] == "mockrobot" && p[2] == "operator" && p[1] != "" ? p[1] : null;
         }
 
         /// <summary>The robot of a fleet/&lt;robot&gt;/cmd topic, or null.</summary>

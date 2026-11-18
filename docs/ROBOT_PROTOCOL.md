@@ -283,7 +283,7 @@ ROS 없이 이 문서대로 MQTT를 직접 말하는 시뮬레이터다. 한 Uni
 | 경로 | 내용 |
 |---|---|
 | `Assets/Fleet/Core` | 프로토콜 핵심. 순수 C#, UnityEngine 참조 없음(asmdef `noEngineReferences`). `fleet_logic.py`를 옮긴 것: `CommandBook`, 발행 정책(`Throttle`), 로봇 1대의 명령·ack·발행(`FleetRobot`), 엘리베이터 탑승(`RobotRide`, 9.1절), 운동·배터리·엘리베이터 움직임(`RobotSim`, mock_fleet.py와 같은 값), 명령줄(`BootArgs`) |
-| `Assets/Fleet/Unity` | `FleetMqtt`(MQTTnet 4.3.7, 연결·LWT·재연결·inbox·송신 큐 하나, `elevator/+/turn|state|trip` 구독), `FleetBootstrap`(로봇 생성, 매 프레임 core 구동, 엘리베이터 메시지를 그 차를 탄 로봇에게 전달, 시작 시 자동 생성), `RobotView`(원기둥 + 방향 표시, 바닥·카메라) |
+| `Assets/Fleet/Unity` | `FleetMqtt`(MQTTnet 4.3.7, 연결·LWT·재연결·inbox·송신 큐 하나 + 끊김 동안 QoS 1을 쌓는 `PendingQueue`, `elevator/+/turn|state|trip`과 `mockrobot/+/operator` 구독), `FleetBootstrap`(로봇 생성, 매 프레임 core 구동, 엘리베이터 메시지를 그 차를 탄 로봇에게 전달, 시작 시 자동 생성), `RobotView`(원기둥 + 방향 표시, 바닥·카메라) |
 | `Assets/Fleet/Editor/BuildScript.cs` | `-executeMethod Fleet.EditorTools.BuildScript.BuildWindows` → `Build/FleetRobots.exe` (Mono, 스트리핑 끔) |
 | `Assets/Fleet/Tests` | EditMode 테스트(`adapter/test_fleet_logic.py`의 해당 사례 + ack 수명·cancel·dock·배터리, `adapter/test_ride_logic.py` 34개 사례를 옮긴 `RobotRideTests`, 로봇별 끊김·명령 버림·와이파이 복귀 순서·하차 실패·갇힘·`can_ride false`의 `FleetRobotRideTests`) |
 | `Assets/Plugins/MQTTnet/MQTTnet.dll` | nuget.org의 MQTTnet 4.3.7.1207 패키지 `lib/netstandard2.1` 그대로(MIT) |
@@ -291,7 +291,7 @@ ROS 없이 이 문서대로 MQTT를 직접 말하는 시뮬레이터다. 한 Uni
 - 좌표: 지도 (x, y) = Unity (x, z). 위에서 보면 x는 오른쪽, y는 위. yaw는 +x에서 반시계.
 - 시계: 발행 정책은 단조 시계(`Stopwatch`), `stamp`와 `expires_at` 비교는 벽시계 유닉스 초. `Time.time`은 쓰지 않는다.
 - 배터리: 움직이면 0.05 %/m, 켜져 있으면 0.002 %/s 줄고, 충전 중 1 %/s 늘며 0..100으로 자른다. dock 위치는 시작 위치다. 이동 중 0 %가 되면 ERROR `battery_empty`.
-- 연결이 끊긴 동안 나갈 메시지는 버린다. fleetd가 명령을 다시 보내고 로봇은 매초 pose·state를 다시 보내므로 따로 쌓아 두지 않는다. 다시 연결되면 pose·state를 바로 보낸다.
+- 연결이 끊긴 동안 나갈 QoS 1 메시지(state, cmd_ack, event, zone)는 paho처럼 순서대로 쌓아 두고(`Core/PendingQueue.cs`, 최대 1000개, 넘으면 가장 오래된 것부터 버리고 센다), 다시 연결해 `online`과 재구독이 끝난 뒤 새 메시지보다 먼저 순서대로 보낸다. QoS 0(pose)은 버린다. 다시 연결되면 pose·state를 바로 보낸다.
 
 실행:
 
@@ -315,7 +315,14 @@ ROS 로봇과 Unity 로봇이 한 운행(한 차)에 섞여 탄다. 탑승 순�
 | 배선 | `Core/FleetRobot.cs`: 끊김 동안 `fleet/*` 발행 없음(예외: 탑승 직전 `BOARDING` 상태와 이벤트 액션), 받은 명령은 **파싱·중복 검사 전에** 버림, ack는 기록만, 복귀 때 pose·state를 정책 무시하고 바로 보냄, `ride` 수락이 진행 중 goto를 `cancelled`로 끝냄, ride를 든 동안 goto·dock 거절 | `adapter/fleet_adapter.py`의 `handle_cmd`, `run`, `send_fleet`, `tick_rides`, `publish_state/pose` |
 | 움직임 | `Core/RobotSim.cs`의 `StartMove`: `board`(로비 → 문 → 칸), `floor`(차 안일 때만 층 바꿈), `exit`(시작할 때 층을 F로, 칸 → 문 → 그 turn의 로비). 차 안 위치는 로비에서 +x로 문 +1.0 m, 칸 0 +1.8 m, 칸마다 +0.8 m. `in_car`는 움직임이 끝날 때만 바뀐다. 움직임 중 고장은 그 자리에 멈추고 `running`으로 남다가 `reset_error`가 시작점으로 되돌린 뒤 `failed` | `mock_robots/mock_fleet.py`의 `on_elevator_move`, `drive_move`, `on_reset_error`, `on_rescue` |
 | 문 구역 시각 | `zone enter`는 움직임을 시작하기 전 프레임에 나가고, `clear`는 칸(탈 때)이나 로비(내릴 때)에 닿은 뒤에 나간다 | ELEVATOR.md 3.10 |
-| MQTT | 연결 하나가 `fleet/<robot>/cmd`(로봇마다) + `elevator/+/turn`, `elevator/+/state`, `elevator/+/trip`(와일드카드, 재연결 때 다시)을 구독한다. 엘리베이터 메시지는 한 번 파싱해 그 차를 탄 로봇에게만 준다. 빈 retained `trip`은 "운행 끝"(지워짐), 객체가 아닌 본문은 무시. retained `trip`의 `turn`으로는 움직이지 않는다. 끊김은 로봇별이라 같은 프로세스의 다른 로봇은 계속 말한다 | `adapter/fleet_adapter.py`의 `subscribe_car`, `handle_elevator` |
+| MQTT | 연결 하나가 `fleet/<robot>/cmd`(로봇마다) + `elevator/+/turn`, `elevator/+/state`, `elevator/+/trip`, `mockrobot/+/operator`(와일드카드, 재연결 때 다시)을 구독한다. 엘리베이터 메시지는 한 번 파싱해 그 차를 탄 로봇에게만 준다. 빈 retained `trip`은 "운행 끝"(지워짐), 객체가 아닌 본문은 무시. retained `trip`의 `turn`으로는 움직이지 않는다. 끊김은 로봇별이라 같은 프로세스의 다른 로봇은 계속 말한다 | `adapter/fleet_adapter.py`의 `subscribe_car`, `handle_elevator` |
+
+**현장 조작(operator) 토픽.** 차 안(문 구역 포함)의 Unity 로봇은 Wi-Fi가 없어 `fleet/*` 명령(`reset_error`, `rescue`)을 받지 못하고 버린다. ROS mock 로봇에는 사람이 현장에서 부르는 로컬 서비스(`/<name>/reset_error`, `/<name>/rescue`)가 있다. Unity 로봇의 같은 역할은 fleet이 아닌 토픽이다.
+
+- 토픽 `mockrobot/<robot>/operator`(시험용, `mockelevator/<id>/fault`와 같은 종류), 본문 `{"action":"reset_error"}` 또는 `{"action":"rescue"}`. QoS는 구독이 1이다. fleetd는 이 토픽을 쓰지도 읽지도 않는다.
+- 로봇은 끊김(`Ride.Silent`) 중에도 받아 처리한다. 동작은 mock의 서비스와 같다(`mock_robots/mock_fleet.py`의 `on_reset_error`, `on_rescue`): `reset_error`는 ERROR가 아니면 거절, 문 구역에서 멈춘 움직임이면 시작점으로 되돌리고 그 움직임을 `failed`로 보고한다(그러면 평소 하차·탑승 실패 흐름이 이어진다). `rescue`는 차 안이 아니면 거절, 차 안이면 탔던 로비로 꺼내고 진행 중 움직임을 `failed`로 끝낸다(`rescued` 이벤트는 `RobotRide`가 평소처럼 낸다).
+- `fleet/<robot>/cmd_ack`에는 아무것도 보내지 않는다(명령이 아니다). 결과는 평소의 `state`·`event`·`zone`으로만 보인다. 알 수 없는 `action`이나 깨진 본문은 로그만 남기고 무시한다.
+- 예: `mosquitto_pub -t mockrobot/unity_1/operator -m '{"action":"reset_error"}'`
 
 어댑터와 다른 점(규약에는 영향 없음): 로봇과 "어댑터"가 한 프로세스라 로봇은 항상 살아 있는 것으로 보고(어댑터의 `is_live`), 움직임 결과를 2 Hz `robot_state`가 아니라 매 프레임 읽는다.
 움직임 id는 실행마다 무작위 값에서 시작한다(어댑터의 `move_base`와 같다).

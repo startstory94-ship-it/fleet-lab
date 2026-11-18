@@ -6,6 +6,9 @@
 # The robots ride elevators like the ROS mocks (docs/ELEVATOR.md); -CanRide false
 # makes them report can_ride:false instead. -ExitFailFloor/-ExitFailCount/-DoorMoveS/
 # -IgnoreTurns are failure injection, as mock_fleet.py's and the adapter's flags.
+# A robot stuck in the elevator door zone (no Wi-Fi, fleet commands dropped) is recovered like the
+# ROS mocks' local services: publish {"action":"reset_error"} or {"action":"rescue"} to
+# mockrobot/<robot>/operator (docs/ROBOT_PROTOCOL.md 9.1).
 # -Window shows the scene instead of running headless. -Background returns at once
 # and prints the process id; stop it with Stop-Process (the broker then sends the LWT).
 param(

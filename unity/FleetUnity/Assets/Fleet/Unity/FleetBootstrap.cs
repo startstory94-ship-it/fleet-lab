@@ -71,8 +71,10 @@ namespace Fleet.UnityApp
             if (!Application.isBatchMode)
                 RobotView.BuildStage(args, transform);
 
-            mqtt = new FleetMqtt(args.BrokerHost, args.BrokerPort, args.Host, names,
-                                 args.CanRide ? Topics.ElevatorFollow : null) { Log = s => Debug.Log($"[fleet] {s}") };
+            // The operator topic is for every robot, riding or not.
+            var extra = new List<string> { Topics.OperatorFilter };
+            if (args.CanRide) extra.AddRange(Topics.ElevatorFollow);
+            mqtt = new FleetMqtt(args.BrokerHost, args.BrokerPort, args.Host, names, extra) { Log = s => Debug.Log($"[fleet] {s}") };
             mqtt.Start();
             lastNow = mono.Elapsed.TotalSeconds;
             Debug.Log($"[fleet] {args.Robots} robots {args.Prefix}_1..{args.Robots} on floor {args.Floor}, host {args.Host}, " +
@@ -101,6 +103,12 @@ namespace Fleet.UnityApp
                     if (Topics.ElevatorBody(kind, payload, out var msg))
                         foreach (var rr in robots)
                             rr.HandleElevator(car, kind, msg, now, wall, outq);
+                    continue;
+                }
+                var op = Topics.RobotOfOperator(topic);
+                if (op != null)
+                {
+                    if (byName.TryGetValue(op, out var or)) or.HandleOperator(payload, wall);
                     continue;
                 }
                 var name = Topics.RobotOfCmd(topic);

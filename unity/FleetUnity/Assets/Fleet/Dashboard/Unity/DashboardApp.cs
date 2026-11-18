@@ -143,6 +143,13 @@ namespace Fleet.Dashboard3D
                 var name = kv.Key;
                 var r = kv.Value;
                 if (inCar.ContainsKey(name)) continue; // drawn in its car below
+                if (Tween(name).HoldAfterCar(now, model.ServerNow(now), r.NewestT))
+                {
+                    // Out of the car per REST, but its track is still the pre-ride one: stay put.
+                    Marker(name).Show(r.V, r.V.Conn, ToVec(Tween(name).Last), Prims.Yaw(Math.PI), "", cam);
+                    seen.Add(name);
+                    continue;
+                }
                 var p = LiveModel.PoseAt(r.Track, t, r.V);
                 if (p == null) continue;
                 var s = p.Value;
@@ -175,11 +182,18 @@ namespace Fleet.Dashboard3D
         /// or a new floor). A robot drawn for the first time snaps.</summary>
         Vector3 Smooth(string name, double now, string source, Vector3 target)
         {
+            var p = Tween(name).Step(now, source, new V3(target.x, target.y, target.z));
+            return ToVec(p);
+        }
+
+        MarkerTween Tween(string name)
+        {
             if (!tweens.TryGetValue(name, out var tw))
                 tweens[name] = tw = new MarkerTween();
-            var p = tw.Step(now, source, new V3(target.x, target.y, target.z));
-            return new Vector3((float)p.X, (float)p.Y, (float)p.Z);
+            return tw;
         }
+
+        static Vector3 ToVec(V3 p) => new Vector3((float)p.X, (float)p.Y, (float)p.Z);
 
         RobotMarker Marker(string name)
         {
