@@ -7,6 +7,8 @@ ROS 2 mock 로봇 → 어댑터(Python) → MQTT(Mosquitto) → 관제 서버 `f
 
 1층의 robot_1·2·3에게 2·4·3층 작업을 동시에 보낸 장면(실제 약 50초를 약 2.3배속). 서버가 탑승 순서를 4층→3층→2층 로봇으로 정해 가장 먼저 내릴 robot_1이 마지막에 문 쪽 칸(칸 0)에 타고, 2·3·4층에서 한 대씩 차례로 내린다. 화면은 엘리베이터가 있는 층을 따라간다. 재현: `scripts\demo.bat` 후 `scripts\demo_tasks.ps1 up`.
 
+**이기종 로봇:** ROS 2 로봇(어댑터 경유)과 ROS 없이 MQTT로 직접 붙는 Unity 로봇을 fleetd 하나가 함께 관제한다. 엘리베이터를 못 타는 로봇은 상태에 `can_ride: false`를 보내고, 다른 층 작업을 받지 않는다. 규약은 [docs/ROBOT_PROTOCOL.md](docs/ROBOT_PROTOCOL.md), 3D 대시보드는 [아래](#3d-대시보드-unity).
+
 ## 왜 만들었나
 
 현업에서 로봇 여러 대를 엘리베이터에 태울 때, **목적층이 같은 로봇끼리만** 함께 태울 수 있었다.
@@ -444,6 +446,35 @@ CI는 위의 Go·node·pytest를 돌리고(`go test`는 `-race`로), e2e는 ROS 
 - **부드러운 움직임:** 브라우저는 서버 시각 기준 350 ms 뒤를 그리며 받은 위치 사이를 보간한다(묶음 두 개보다 조금 더: 거의 항상 앞의 위치가 있다). 그래도 최신 위치를 지나면,
   이동 중인 로봇은 속도·방향으로 최대 250 ms까지 더 움직이고 멈춘다. 멈춰 있다 출발한 로봇은 직전까지 그 자리에 둔다. 층이 바뀌면 보간하지 않고 옮긴다.
 - **멀리 있는 점:** |x|·|y| > 1,000,000 m인 점은 화면 범위 계산에서 뺀다. 격자는 축마다 200줄을 넘지 않도록 간격을 1·5·10·50… m로 늘린다(리뷰 5-2: 먼 점 하나로 화면이 멈췄다).
+
+### 3D 대시보드 (Unity)
+
+![3D 대시보드: 목적층이 다른 로봇 3대가 엘리베이터로 2·3·4층에 내리고, 1층에는 Unity 로봇 2대가 있다](docs/demo3d.gif)
+
+`unity/FleetUnity`의 두 번째 플레이어. 층을 위로 쌓아 놓고 로봇 전체·엘리베이터 통로·움직이는 차·차 안 로봇을 한 화면에 보여 주는 **보기 전용** 화면이다.
+fleetd하고만 말하므로(`/ws/live`, `GET /elevators`·`/tasks`·`/events`) ROS 로봇과 Unity 로봇이 똑같이 보인다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\unity_build.ps1 -Target dashboard   # robots | dashboard | all
+powershell -ExecutionPolicy Bypass -File scripts\unity_dashboard.ps1 -Follow        # [-Api http://127.0.0.1:8080] [-FloorHeight 5]
+# GIF용 PNG: ... unity_dashboard.ps1 -Follow -Capture C:\cap -CaptureMs 200 -CaptureSeconds 60 -CaptureQuit
+```
+
+- **구조:** `Assets/Fleet/Dashboard/Core`(asmdef `Fleet.Dashboard.Core`, UnityEngine 참조 없음)가 `web/app.js`를 옮긴 것이다: 묶음 처리(snapshot은 교체, delta는 적용,
+  `removed`는 삭제, seq 빈틈은 세기만 하고 적용, heartbeat는 시계 차이만), 서버 시계 차이, 350 ms 뒤 보간·250 ms 외삽, 정지 뒤 출발, 층 바뀜, 3초 자르기,
+  로봇 색 규칙, 칸·차 안 로봇·차 윤곽, 격자, 넓어지기만 하는 범위, 백오프(0.5~10초, jitter). 코드 주석에 app.js 줄 번호가 있다.
+  차는 `/elevators`의 층이 "마지막으로 지난 층"이므로 층이 바뀐 시각과 층당 이동 시간(관측값)으로 층 사이 높이를 추정한다(`CarMotion`).
+- **전송:** `ILiveTransport` 뒤에 `ClientWebSocket` 구현(백그라운드 작업에서 받고 큐로 메인 스레드에 넘김, 큰 스냅샷은 여러 조각을 모음, 5초 동안 아무것도 오지 않으면 다시 연결). 연결 실패 때
+  `/ws/live`에 평범한 GET을 한 번 보내 503(구독자 한도)인지 확인해 "server full"로 보인다. REST는 `UnityWebRequest`(`/elevators`는 운행이 있거나 차가 움직이면 0.25초, 아니면 1초마다).
+- **화면:** 층마다 반투명 판·1 m 격자·층 번호, 로비 자리, 첫 엘리베이터 자리에 구멍과 통로, 문(열리면 초록)이 있는 차. 로봇 색은 2D 범례와 같다(STALE 흐림 + 점선 고리,
+  OFFLINE 어두운 색 + X, 차 안은 보라와 내릴 층). 진행 중 작업의 남은 지점은 주황 핀. 왼쪽 위에 연결·로봇 수(연결 상태별)·작업 수·차 상태·칸, 오른쪽 위에 최근 이벤트.
+- **조작:** 왼쪽 드래그 회전, 오른쪽·가운데 드래그 이동, 휠 확대, 1~9/0 층 맞춤, F 차 따라가기, H 전체. 창이 가려져도 멈추지 않는다(`runInBackground`: 멈추면 fleetd가 5초 쓰기 제한으로 닫는다).
+- **명령줄:** `-api`, `-floorHeight`(기본 5 m: 낮은 카메라에서 층이 겹쳐 보이지 않게 실제보다 높게), `-follow`, `-focus F`, `-yaw`/`-pitch`/`-distance`,
+  `-capture <dir> -captureMs n -captureSeconds n [-captureQuit]`, 창 크기는 Unity의 `-screen-width`/`-screen-height`.
+- **장면:** `Assets/Scenes/Dashboard.unity`는 `DashboardScene.Build`가 코드로 만든다(빌드할 때마다 다시). 재질 에셋을 장면이 참조해야 빌드에 셰이더가 남는다.
+  로봇 플레이어 빌드에는 `Main.unity`만, 대시보드 빌드에는 `Dashboard.unity`만 들어간다. 로봇 자동 생성(`FleetBootstrap`)은 Dashboard 장면에서는 하지 않는다.
+- **다음 단계(하지 않음):** WebGL. 브라우저 WebSocket을 쓰는 jslib 전송을 `ILiveTransport`로 더하고, `websocket.Accept`가 다른 출처를 거절하므로 fleetd가 같은 출처에서
+  빌드를 내보내야 한다(예: `fleetd -web3d <dir>`을 `/3d/`에). WebGL은 IL2CPP라 Newtonsoft 스트리핑 설정도 필요하다.
 
 ### `/ws/live` 묶음
 

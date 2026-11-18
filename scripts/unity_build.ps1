@@ -1,7 +1,11 @@
-# Builds the Unity robot player (unity/FleetUnity) to unity/FleetUnity/Build/FleetRobots.exe.
-#   powershell -ExecutionPolicy Bypass -File scripts\unity_build.ps1 [-Unity <Unity.exe>] [-Test]
+# Builds the Unity players (unity/FleetUnity):
+#   robots     unity/FleetUnity/Build/FleetRobots.exe (headless MQTT robots, Main.unity only)
+#   dashboard  unity/FleetUnity/Build/Dashboard/FleetDashboard.exe (3D fleet view, Dashboard.unity only)
+#   powershell -ExecutionPolicy Bypass -File scripts\unity_build.ps1 [-Target robots|dashboard|all] [-Unity <Unity.exe>] [-Test]
 # -Test also runs the EditMode tests first (results in unity/FleetUnity/TestResults.xml).
+# Only one editor may open the project at a time, so the steps run one after another.
 param(
+    [ValidateSet('robots', 'dashboard', 'all')][string]$Target = 'robots',
     [string]$Unity = $(if ($env:UNITY_EXE) { $env:UNITY_EXE } else { 'C:\Program Files\Unity\Hub\Editor\6000.6.9f1\Editor\Unity.exe' }),
     [switch]$Test
 )
@@ -24,9 +28,19 @@ if ($Test) {
     if ($p.ExitCode -ne 0 -or $run.failed -ne '0') { throw "tests failed (exit $($p.ExitCode))" }
 }
 
-$p = Start-Process -FilePath $Unity -Wait -PassThru -NoNewWindow -ArgumentList @(
-    '-batchmode', '-nographics', '-quit', '-projectPath', "`"$project`"",
-    '-executeMethod', 'Fleet.EditorTools.BuildScript.BuildWindows', '-logFile', "`"$logs\build.log`"")
-Select-String -Path "$logs\build.log" -Pattern '^\[build\]' | ForEach-Object { Write-Host $_.Line }
-if ($p.ExitCode -ne 0) { throw "build failed (exit $($p.ExitCode)); see $logs\build.log" }
-Write-Host "built $project\Build\FleetRobots.exe"
+# target -> build method, log, output
+$builds = @{
+    robots    = @('BuildWindows', 'build.log', 'Build\FleetRobots.exe')
+    dashboard = @('BuildDashboard', 'build-dashboard.log', 'Build\Dashboard\FleetDashboard.exe')
+}
+$names = if ($Target -eq 'all') { @('robots', 'dashboard') } else { @($Target) }
+foreach ($name in $names) {
+    $method, $logName, $exe = $builds[$name]
+    $log = Join-Path $logs $logName
+    $p = Start-Process -FilePath $Unity -Wait -PassThru -NoNewWindow -ArgumentList @(
+        '-batchmode', '-nographics', '-quit', '-projectPath', "`"$project`"",
+        '-executeMethod', "Fleet.EditorTools.BuildScript.$method", '-logFile', "`"$log`"")
+    Select-String -Path $log -Pattern '^\[build\]' | ForEach-Object { Write-Host $_.Line }
+    if ($p.ExitCode -ne 0) { throw "$name build failed (exit $($p.ExitCode)); see $log" }
+    Write-Host "built $project\$exe"
+}

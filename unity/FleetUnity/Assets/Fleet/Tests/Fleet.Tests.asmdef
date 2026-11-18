@@ -1,7 +1,7 @@
 {
     "name": "Fleet.Tests",
     "rootNamespace": "Fleet.Tests",
-    "references": ["Fleet.Core", "UnityEngine.TestRunner", "UnityEditor.TestRunner"],
+    "references": ["Fleet.Core", "Fleet.Dashboard.Core", "UnityEngine.TestRunner", "UnityEditor.TestRunner"],
     "includePlatforms": ["Editor"],
     "excludePlatforms": [],
     "allowUnsafeCode": false,

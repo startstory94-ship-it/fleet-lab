@@ -1,7 +1,7 @@
 {
     "name": "Fleet.Editor",
     "rootNamespace": "Fleet.EditorTools",
-    "references": [],
+    "references": ["Fleet.Dashboard.Unity"],
     "includePlatforms": ["Editor"],
     "excludePlatforms": [],
     "allowUnsafeCode": false,

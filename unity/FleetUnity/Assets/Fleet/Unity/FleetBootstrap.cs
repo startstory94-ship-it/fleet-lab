@@ -25,6 +25,9 @@ namespace Fleet.UnityApp
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         static void AutoCreate()
         {
+            // This assembly ships in the dashboard player too; robots there would
+            // connect to MQTT as a second host "unity-1".
+            if (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == "Dashboard") return;
             if (FindAnyObjectByType<FleetBootstrap>() == null)
                 new GameObject("FleetBootstrap").AddComponent<FleetBootstrap>();
         }

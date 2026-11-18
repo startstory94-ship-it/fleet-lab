@@ -1,7 +1,10 @@
-// Batch build of the robot player:
+// Batch builds of the two players:
 //   Unity.exe -batchmode -quit -projectPath unity/FleetUnity
 //             -executeMethod Fleet.EditorTools.BuildScript.BuildWindows [-buildOutput <exe>]
-// Output defaults to unity/FleetUnity/Build/FleetRobots.exe.
+//             -executeMethod Fleet.EditorTools.BuildScript.BuildDashboard [-buildOutput <exe>]
+// Robots default to unity/FleetUnity/Build/FleetRobots.exe (only Main.unity),
+// the 3D dashboard to unity/FleetUnity/Build/Dashboard/FleetDashboard.exe
+// (only Dashboard.unity, rebuilt from code first).
 using System;
 using System.IO;
 using UnityEditor;
@@ -22,7 +25,32 @@ namespace Fleet.EditorTools
             var output = Arg("-buildOutput") ??
                          Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Build", "FleetRobots.exe"));
             EnsureScene();
+            CommonSettings();
+            PlayerSettings.productName = "FleetRobots";
+            Build(ScenePath, output);
+        }
 
+        [MenuItem("Fleet/Build Dashboard Player")]
+        public static void BuildDashboard()
+        {
+            var output = Arg("-buildOutput") ??
+                         Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Build", "Dashboard", "FleetDashboard.exe"));
+            EnsureScene(); // build settings stay Main-only
+            DashboardScene.Build();
+            CommonSettings();
+            // productName is project-wide (ProjectSettings.asset); put the robots' back afterwards.
+            var product = PlayerSettings.productName;
+            PlayerSettings.productName = "FleetDashboard";
+            try { Build(DashboardScene.ScenePath, output); }
+            finally
+            {
+                PlayerSettings.productName = product;
+                AssetDatabase.SaveAssets();
+            }
+        }
+
+        static void CommonSettings()
+        {
             // Mono, nothing stripped: MQTTnet and Newtonsoft use reflection.
             var target = NamedBuildTarget.Standalone;
             PlayerSettings.SetScriptingBackend(target, ScriptingImplementation.Mono2x);
@@ -33,13 +61,15 @@ namespace Fleet.EditorTools
             PlayerSettings.defaultScreenWidth = 1280;
             PlayerSettings.defaultScreenHeight = 720;
             PlayerSettings.resizableWindow = true;
-            PlayerSettings.productName = "FleetRobots";
             PlayerSettings.companyName = "fleet-lab";
             PlayerSettings.usePlayerLog = true;
+        }
 
+        static void Build(string scene, string output)
+        {
             var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
             {
-                scenes = new[] { ScenePath },
+                scenes = new[] { scene },
                 locationPathName = output,
                 target = BuildTarget.StandaloneWindows64,
                 options = BuildOptions.None,
