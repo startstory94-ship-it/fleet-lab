@@ -177,12 +177,44 @@ fleetd/
 - GitHub Actions로 테스트 자동 실행.
 - README: 구조도, 실행 방법, 데모 GIF, 설계 이유, 부하 테스트 결과, "실제 운영이라면"(보안·ACL·TLS, 경로 거리 기반 배정, 시계열 DB).
 
+### 8단계: 이기종 로봇 (Unity) — 8a·8b·8c 완료
+
+**왜:** 현장 관제는 한 회사 로봇만 다루지 않는다. ROS를 쓰지 않는 로봇이 같은 규약으로 붙어도 서버가 그대로 관제하는지,
+그리고 그 규약이 문서만으로 구현 가능한지를 확인한다. Unity로 만든 로봇이 "다른 회사 로봇" 역할을 한다.
+
+**8a. MQTT로 직접 붙는 로봇 (완료, PR #8)**
+- 규약 문서 `docs/ROBOT_PROTOCOL.md`: 엘리베이터를 타지 않는 로봇이 지킬 것 전부(토픽·QoS·retained, boot+seq, pose/state 주기, 명령 수명주기, 호스트 상태와 LWT). 코드에서 옮겨 적고 근거를 `파일:줄`로 단다.
+- Unity 로봇(`unity/FleetUnity`): UnityEngine 없는 C# 프로토콜 코어 + MQTTnet 연결 + 화면 없는 Windows 플레이어. 프로세스 하나가 로봇 여러 대를 돌린다.
+- fleetd `can_ride`: 상태에 `can_ride: false`를 보내는 로봇은 다른 층 지점이 있는 작업을 받지 않는다(없으면 true). 배정 뒤 false가 되면 시도 1번을 쓰고 다시 대기열로.
+- 완료 기준: fleetd 하나에 ROS 로봇(어댑터)과 Unity 로봇을 함께 붙여 같은 층 작업 → Unity, 다른 층 작업 → ROS(엘리베이터), 취소, Unity 프로세스 종료 시 Unity 로봇만 OFFLINE(LWT).
+
+**8b. 3D 대시보드 (완료, PR #8)**
+- Unity 두 번째 플레이어. fleetd하고만 말한다(`/ws/live`, `/elevators`, `/tasks`, `/events`). 층을 쌓아 로봇·엘리베이터 통로·움직이는 차·차 안 로봇을 그린다.
+- `web/app.js`의 묶음 처리(snapshot/delta/heartbeat, seq 빈틈, 시계 차이, 보간·외삽)를 순수 C#으로 옮긴다. 보기 전용.
+- WebGL은 하지 않는다(fleetd가 같은 출처에서 빌드를 내보내야 하고 jslib 전송이 필요).
+
+**8c. Unity 로봇 엘리베이터 탑승 + 대시보드 보정 (완료)**
+- 목표: **ROS 로봇과 Unity 로봇이 한 엘리베이터 운행에 함께 타서 각자 다른 층에 내린다.** fleetd·mock 엘리베이터·어댑터는 바꾸지 않는다: 6단계 규약(ELEVATOR.md)을 Unity 로봇이 그대로 지킨다.
+- ① 탑승 로직: 어댑터의 `RobotRide`(`adapter/fleet_logic.py`)를 Unity C# 코어로 옮긴다. ride 수락·대기, turn 처리(같은 `n`은 같은 답), `zone` 응답, `BOARDING` + `silence_s`와 끊김(탑승 turn 직후 ~ 하차 `clear` 1초 뒤, 그동안 `fleet/*` 없음), 복귀 순서(`pose` → `state` → 쌓인 이벤트 → `done`+층), 탑승 실패·하차 막힘·움직임 시간 초과·운행이 로봇을 태운 채 끝남(ERROR "needs a human").
+- ② 움직임: 로비 → 문 → 자기 칸, 차 안에서 층 따라가기, 칸 → 문 → 하차 층. 칸 위치는 mock 로봇과 같다(로비 +x, 문 +1.0 m, 칸 0 +1.8 m, 칸마다 +0.8 m).
+- ③ 연결: `elevator/+/turn`·`state`·`trip` 구독, `zone` 발행. 끊김은 로봇마다(같은 프로세스의 다른 로봇은 계속 말함).
+- ④ Unity 로봇 기본값 `can_ride: true`, 못 타는 로봇 데모용 `-canRide false`는 남긴다.
+- ⑤ 대시보드 보정: 로봇을 그리는 위치가 "칸 자리" ↔ "보고된 위치"로 바뀌거나 층이 바뀌어 기록이 끊길 때 약 0.6초 동안 이어서 옮긴다(지금은 순간이동). 차 안 로봇은 위치를 보내지 않으므로 이것은 화면 보정이지 보고된 위치가 아니다.
+- 순서: 같이 타기가 막히면 Unity 로봇 혼자 타기를 먼저 끝낸다.
+- 완료 기준:
+  - Unity 로봇만으로 다른 층 작업 완료(올바른 층, `door_zone` 최대 1, 차 안에서 `fleet/*` 0개).
+  - 한 운행에 ROS·Unity 로봇이 섞여 타고(`GET /elevators`의 운행에 두 종류가 함께), 계획대로 탑승·각자 층에 하차, `door_zone` 최대 1.
+  - Unity 로봇 하차 막힘 → ELEVATOR.md 6장대로 재시도·다음 층.
+  - 어댑터 탑승 테스트 34개를 옮긴 C# 테스트 통과, 기존 e2e 71개 그대로 통과.
+  - 3D 대시보드에서 타고 내릴 때 튀지 않는 데모 영상.
+
 ## 7. 기술 선택
 - Go 1.27, 표준 `net/http`, `log/slog`.
 - MQTT 클라이언트: `eclipse/paho.golang` (MQTT 5).
 - WebSocket: `coder/websocket`.
 - SQLite: `modernc.org/sqlite` (cgo 없이 Windows 빌드 가능).
 - 어댑터: Python, rclpy, paho-mqtt 2.1.
+- 이기종 로봇·3D 대시보드: Unity 6.6(6000.6.9f1), C#, MQTTnet 4.3, Newtonsoft.Json.
 
 ## 8. 하지 않는 것
 - 로봇 자체의 경로 계획과 충돌 회피(Nav2의 일). 관제는 누가, 어디로, 언제 갈지만 정한다.

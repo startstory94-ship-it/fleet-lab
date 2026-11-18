@@ -84,8 +84,9 @@ namespace Fleet.Tests
         }
 
         [Test]
-        public void StateFieldsAndCanRideFalseEverywhere()
+        public void StateFieldsAndCanRideEverywhere()
         {
+            // can_ride is true by default now (Unity robots ride, docs/ELEVATOR.md); -canRide false keeps the old robot.
             Cmd(Goto("c1", 2, 0));
             Run(4.0);
             Cmd("{\"cmd_id\":\"d1\",\"type\":\"dock\"}");
@@ -95,7 +96,7 @@ namespace Fleet.Tests
             foreach (var s in states)
             {
                 Assert.AreEqual(JTokenType.Boolean, s["can_ride"].Type);
-                Assert.IsFalse((bool)s["can_ride"]);
+                Assert.IsTrue((bool)s["can_ride"]);
                 Assert.AreEqual(0, (int)s["silence_s"]);
                 Assert.That((double)s["battery"], Is.InRange(0.0, 100.0));
                 Assert.IsNotNull(s["task_id"]);
@@ -104,6 +105,10 @@ namespace Fleet.Tests
             var pose = Take("pose").Last();
             Assert.AreEqual(1, (int)pose["floor"]);
             Assert.AreEqual("map", (string)pose["frame"]);
+            r.CanRide = false;
+            r.PublishSoon();
+            Run(0.05);
+            Assert.IsFalse((bool)Take("state").Single()["can_ride"]);
         }
 
         [Test]
@@ -294,14 +299,18 @@ namespace Fleet.Tests
         }
 
         [Test]
-        public void UnknownTypesAndRideFail()
+        public void UnknownTypesAndBadRidesFail()
         {
             Cmd("{\"cmd_id\":\"k1\",\"type\":\"dance\"}");
             Cmd("{\"cmd_id\":\"k2\",\"type\":\"ride\",\"ride\":{}}");
+            r.CanRide = false;
+            Cmd("{\"cmd_id\":\"k3\",\"type\":\"ride\",\"ride\":{}}");
             var acks = Take("cmd_ack");
-            Assert.AreEqual(2, acks.Count);
+            Assert.AreEqual(3, acks.Count);
             Assert.That(acks.Select(x => (string)x["status"]), Is.All.EqualTo("failed"));
-            StringAssert.Contains("unknown command type 'ride'", (string)acks[1]["message"]);
+            StringAssert.Contains("unknown command type 'dance'", (string)acks[0]["message"]);
+            StringAssert.Contains("ride without a plan", (string)acks[1]["message"]);
+            StringAssert.Contains("can_ride false", (string)acks[2]["message"]);
         }
 
         [Test]

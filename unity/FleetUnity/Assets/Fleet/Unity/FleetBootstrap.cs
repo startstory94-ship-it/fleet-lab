@@ -53,8 +53,16 @@ namespace Fleet.UnityApp
                 {
                     Speed = args.Speed,
                     Floor = args.Floor,
+                    ExitFailFloor = args.ExitFailFloor,
+                    ExitFailCount = args.ExitFailFloor.HasValue ? args.ExitFailCount : 0,
+                    DoorMoveS = args.DoorMoveS,
                 };
-                var r = new FleetRobot(name, args.Host, sim) { Log = s => Debug.Log($"[fleet] {s}") };
+                args.IgnoreTurns.TryGetValue(name, out var ignore);
+                var r = new FleetRobot(name, args.Host, sim, ignoreTurns: ignore, moveExtra: args.MoveTimeoutExtra)
+                {
+                    CanRide = args.CanRide,
+                    Log = s => Debug.Log($"[fleet] {s}"),
+                };
                 robots.Add(r);
                 byName[name] = r;
                 names.Add(name);
@@ -63,11 +71,16 @@ namespace Fleet.UnityApp
             if (!Application.isBatchMode)
                 RobotView.BuildStage(args, transform);
 
-            mqtt = new FleetMqtt(args.BrokerHost, args.BrokerPort, args.Host, names) { Log = s => Debug.Log($"[fleet] {s}") };
+            // The operator topic is for every robot, riding or not.
+            var extra = new List<string> { Topics.OperatorFilter };
+            if (args.CanRide) extra.AddRange(Topics.ElevatorFollow);
+            mqtt = new FleetMqtt(args.BrokerHost, args.BrokerPort, args.Host, names, extra) { Log = s => Debug.Log($"[fleet] {s}") };
             mqtt.Start();
             lastNow = mono.Elapsed.TotalSeconds;
             Debug.Log($"[fleet] {args.Robots} robots {args.Prefix}_1..{args.Robots} on floor {args.Floor}, host {args.Host}, " +
-                      $"broker {args.BrokerHost}:{args.BrokerPort}, origin ({args.OriginX}, {args.OriginY}), speed {args.Speed} m/s");
+                      $"broker {args.BrokerHost}:{args.BrokerPort}, origin ({args.OriginX}, {args.OriginY}), speed {args.Speed} m/s, " +
+                      $"can_ride {args.CanRide}" + (args.ExitFailFloor.HasValue ? $", exits fail on floor {args.ExitFailFloor} ({args.ExitFailCount})" : "") +
+                      (args.DoorMoveS > 0 ? $", door moves {args.DoorMoveS} s" : ""));
         }
 
         void Update()
@@ -84,6 +97,20 @@ namespace Fleet.UnityApp
             }
             while (mqtt.TryReceive(out var topic, out var payload))
             {
+                if (Topics.ParseElevator(topic, out var car, out var kind))
+                {
+                    // Parsed once; every robot decides itself whether it rides that car.
+                    if (Topics.ElevatorBody(kind, payload, out var msg))
+                        foreach (var rr in robots)
+                            rr.HandleElevator(car, kind, msg, now, wall, outq);
+                    continue;
+                }
+                var op = Topics.RobotOfOperator(topic);
+                if (op != null)
+                {
+                    if (byName.TryGetValue(op, out var or)) or.HandleOperator(payload, wall);
+                    continue;
+                }
                 var name = Topics.RobotOfCmd(topic);
                 if (name != null && byName.TryGetValue(name, out var r))
                     r.HandleCommand(payload, now, wall, outq);

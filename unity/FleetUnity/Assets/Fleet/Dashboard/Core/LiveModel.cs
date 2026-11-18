@@ -54,6 +54,8 @@ namespace Fleet.Dashboard
     {
         public RobotView V;
         public readonly List<Sample> Track = new List<Sample>();
+        /// <summary>Time of the newest sample, NaN without one.</summary>
+        public double NewestT => Track.Count > 0 ? Track[Track.Count - 1].T : double.NaN;
     }
 
     public sealed class LiveModel
@@ -160,7 +162,10 @@ namespace Fleet.Dashboard
         }
 
         /// <summary>renderTime (app.js 373-375).</summary>
-        public double RenderTime(double localNowMs) => localNowMs + (ClockOffset ?? 0) - RenderDelayMs;
+        public double RenderTime(double localNowMs) => ServerNow(localNowMs) - RenderDelayMs;
+
+        /// <summary>The server clock now, the time base of the track samples.</summary>
+        public double ServerNow(double localNowMs) => localNowMs + (ClockOffset ?? 0);
 
         /// <summary>
         /// poseAt (app.js 29-52): position at time t (server clock) interpolated

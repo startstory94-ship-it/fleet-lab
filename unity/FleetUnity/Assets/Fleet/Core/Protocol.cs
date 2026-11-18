@@ -23,6 +23,11 @@ namespace Fleet.Core
         public const string Docking = "DOCKING";
         public const string Charging = "CHARGING";
         public const string Error = "ERROR";
+        // Ride modes are reported by RobotRide's overlay, not by RobotSim.
+        public const string WaitingElevator = "WAITING_ELEVATOR";
+        public const string Boarding = "BOARDING";
+        public const string Riding = "RIDING";
+        public const string Exiting = "EXITING";
     }
 
     public static class Topics
@@ -32,6 +37,50 @@ namespace Fleet.Core
         public static string Cmd(string robot) => $"fleet/{robot}/cmd";
         public static string CmdAck(string robot) => $"fleet/{robot}/cmd_ack";
         public static string AdapterStatus(string host) => $"fleet/adapter/{host}/status";
+        public static string Event(string robot) => $"fleet/{robot}/event";
+        public static string Zone(string car) => $"elevator/{car}/zone";
+
+        /// <summary>A person on site, not the fleet: mockrobot/&lt;robot&gt;/operator, like the
+        /// mock elevator's mockelevator/&lt;id&gt;/fault. Works while the robot is in the car and silent.</summary>
+        public const string OperatorFilter = "mockrobot/+/operator";
+
+        /// <summary>What a riding robot follows (docs/ELEVATOR.md 2), subscribed with
+        /// a wildcard so one connection serves every robot and every car.</summary>
+        public static readonly string[] ElevatorFollow = { "elevator/+/turn", "elevator/+/state", "elevator/+/trip" };
+
+        /// <summary>Splits elevator/&lt;car&gt;/&lt;kind&gt; (kind turn, state or trip). False for anything else.</summary>
+        public static bool ParseElevator(string topic, out string car, out string kind)
+        {
+            car = kind = null;
+            var p = topic.Split('/');
+            if (p.Length != 3 || p[0] != "elevator" || p[1] == "") return false;
+            if (p[2] != "turn" && p[2] != "state" && p[2] != "trip") return false;
+            car = p[1];
+            kind = p[2];
+            return true;
+        }
+
+        /// <summary>The body of an elevator message as fleet_adapter.handle_elevator reads it:
+        /// an empty trip payload is a cleared retained trip (ok, msg null); a payload
+        /// that is not a JSON object is ignored (false).</summary>
+        public static bool ElevatorBody(string kind, string payload, out Newtonsoft.Json.Linq.JObject msg)
+        {
+            msg = null;
+            if (kind == "trip" && string.IsNullOrEmpty(payload)) return true;
+            try
+            {
+                msg = Newtonsoft.Json.Linq.JToken.Parse(payload) as Newtonsoft.Json.Linq.JObject;
+            }
+            catch (Newtonsoft.Json.JsonException) { return false; }
+            return msg != null;
+        }
+
+        /// <summary>The robot of a mockrobot/&lt;robot&gt;/operator topic, or null.</summary>
+        public static string RobotOfOperator(string topic)
+        {
+            var p = topic.Split('/');
+            return p.Length == 3 && p[0] == "mockrobot" && p[2] == "operator" && p[1] != "" ? p[1] : null;
+        }
 
         /// <summary>The robot of a fleet/&lt;robot&gt;/cmd topic, or null.</summary>
         public static string RobotOfCmd(string topic)

@@ -25,6 +25,8 @@ namespace Fleet.Dashboard3D
         Transform world;
         FloorStack floors;
         readonly Dictionary<string, RobotMarker> markers = new Dictionary<string, RobotMarker>();
+        // Display smoothing when a marker's source changes (MarkerTween): never the reported position.
+        readonly Dictionary<string, MarkerTween> tweens = new Dictionary<string, MarkerTween>();
         readonly Dictionary<string, CarView> cars = new Dictionary<string, CarView>();
         readonly List<GameObject> pins = new List<GameObject>();
         Dictionary<string, InCar> inCar = new Dictionary<string, InCar>();
@@ -141,10 +143,19 @@ namespace Fleet.Dashboard3D
                 var name = kv.Key;
                 var r = kv.Value;
                 if (inCar.ContainsKey(name)) continue; // drawn in its car below
+                if (Tween(name).HoldAfterCar(now, model.ServerNow(now), r.NewestT))
+                {
+                    // Out of the car per REST, but its track is still the pre-ride one: stay put.
+                    Marker(name).Show(r.V, r.V.Conn, ToVec(Tween(name).Last), Prims.Yaw(Math.PI), "", cam);
+                    seen.Add(name);
+                    continue;
+                }
                 var p = LiveModel.PoseAt(r.Track, t, r.V);
                 if (p == null) continue;
                 var s = p.Value;
-                Marker(name).Show(r.V, r.V.Conn, Prims.W(s.X, s.Y, FloorY(s.Floor)), Prims.Yaw(s.Yaw), "", cam);
+                // The track is cleared on a floor change, so a new floor is a new source.
+                var at = Smooth(name, now, "t" + s.Floor, Prims.W(s.X, s.Y, FloorY(s.Floor)));
+                Marker(name).Show(r.V, r.V.Conn, at, Prims.Yaw(s.Yaw), "", cam);
                 seen.Add(name);
             }
             // Robots that may be in a car, by slot, in the elevator colour (app.js 806-811).
@@ -154,15 +165,35 @@ namespace Fleet.Dashboard3D
                 model.Robots.TryGetValue(kv.Key, out var r);
                 var slot = car.View.Trip?.Riders.FirstOrDefault(x => x.Robot == kv.Key);
                 string extra = slot != null ? $" > {slot.Exit}F" : "";
-                Marker(kv.Key).Show(r?.V, "IN_ELEVATOR", car.SlotPosition(kv.Value.Slot), Prims.Yaw(Math.PI), extra, cam, Math.Max(0, kv.Value.Slot));
+                var at = Smooth(kv.Key, now, "c" + kv.Value.Car, car.SlotPosition(kv.Value.Slot));
+                Marker(kv.Key).Show(r?.V, "IN_ELEVATOR", at, Prims.Yaw(Math.PI), extra, cam, Math.Max(0, kv.Value.Slot));
                 seen.Add(kv.Key);
             }
             foreach (var name in markers.Keys.Where(n => !seen.Contains(n)).ToList())
             {
                 Destroy(markers[name].gameObject);
                 markers.Remove(name);
+                tweens.Remove(name); // drawn again later: it snaps, like a new robot
             }
         }
+
+        /// <summary>Where to draw a marker: target, or on the way to it for
+        /// MarkerTween.DurationMs after its source changed (track &lt;-&gt; car slot,
+        /// or a new floor). A robot drawn for the first time snaps.</summary>
+        Vector3 Smooth(string name, double now, string source, Vector3 target)
+        {
+            var p = Tween(name).Step(now, source, new V3(target.x, target.y, target.z));
+            return ToVec(p);
+        }
+
+        MarkerTween Tween(string name)
+        {
+            if (!tweens.TryGetValue(name, out var tw))
+                tweens[name] = tw = new MarkerTween();
+            return tw;
+        }
+
+        static Vector3 ToVec(V3 p) => new Vector3((float)p.X, (float)p.Y, (float)p.Z);
 
         RobotMarker Marker(string name)
         {

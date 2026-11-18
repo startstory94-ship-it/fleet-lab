@@ -7,7 +7,7 @@ ROS 2 mock 로봇 → 어댑터(Python) → MQTT(Mosquitto) → 관제 서버 `f
 
 1층의 robot_1·2·3에게 2·4·3층 작업을 동시에 보낸 장면(실제 약 50초를 약 2.3배속). 서버가 탑승 순서를 4층→3층→2층 로봇으로 정해 가장 먼저 내릴 robot_1이 마지막에 문 쪽 칸(칸 0)에 타고, 2·3·4층에서 한 대씩 차례로 내린다. 화면은 엘리베이터가 있는 층을 따라간다. 재현: `scripts\demo.bat` 후 `scripts\demo_tasks.ps1 up`.
 
-**이기종 로봇:** ROS 2 로봇(어댑터 경유)과 ROS 없이 MQTT로 직접 붙는 Unity 로봇을 fleetd 하나가 함께 관제한다. 엘리베이터를 못 타는 로봇은 상태에 `can_ride: false`를 보내고, 다른 층 작업을 받지 않는다. 규약은 [docs/ROBOT_PROTOCOL.md](docs/ROBOT_PROTOCOL.md), 3D 대시보드는 [아래](#3d-대시보드-unity).
+**이기종 로봇:** ROS 2 로봇(어댑터 경유)과 ROS 없이 MQTT로 직접 붙는 Unity 로봇을 fleetd 하나가 함께 관제한다. Unity 로봇도 ROS 로봇과 같은 엘리베이터 규약으로 타서, 두 종류가 한 차에 함께 탄다([docs/ROBOT_PROTOCOL.md 9.1](docs/ROBOT_PROTOCOL.md#91-엘리베이터-탑승)). 엘리베이터를 못 타는 로봇(Unity `-canRide false`)은 상태에 `can_ride: false`를 보내고, 다른 층 작업을 받지 않는다. 규약은 [docs/ROBOT_PROTOCOL.md](docs/ROBOT_PROTOCOL.md), 3D 대시보드는 [아래](#3d-대시보드-unity).
 
 ## 왜 만들었나
 
@@ -468,6 +468,8 @@ powershell -ExecutionPolicy Bypass -File scripts\unity_dashboard.ps1 -Follow    
   `/ws/live`에 평범한 GET을 한 번 보내 503(구독자 한도)인지 확인해 "server full"로 보인다. REST는 `UnityWebRequest`(`/elevators`는 운행이 있거나 차가 움직이면 0.25초, 아니면 1초마다).
 - **화면:** 층마다 반투명 판·1 m 격자·층 번호, 로비 자리, 첫 엘리베이터 자리에 구멍과 통로, 문(열리면 초록)이 있는 차. 로봇 색은 2D 범례와 같다(STALE 흐림 + 점선 고리,
   OFFLINE 어두운 색 + X, 차 안은 보라와 내릴 층). 진행 중 작업의 남은 지점은 주황 핀. 왼쪽 위에 연결·로봇 수(연결 상태별)·작업 수·차 상태·칸, 오른쪽 위에 최근 이벤트.
+- **탈 때·내릴 때 부드럽게:** 로봇 표시가 그리는 출처를 바꾸면(층 위 궤적 ↔ 차의 칸, 층이 바뀌어 궤적이 새로 시작) 순간 이동하지 않고 마지막으로 그린 자리에서 새 목표까지
+  0.6초 동안 ease-out으로 옮겨 간다(`Dashboard/Core/MarkerTween.cs`). 처음 보이는 로봇은 바로 그 자리에 그린다. **화면 표시만 부드럽게 하는 것이고, 로봇이 보고한 위치나 서버 상태와는 상관없다.**
 - **조작:** 왼쪽 드래그 회전, 오른쪽·가운데 드래그 이동, 휠 확대, 1~9/0 층 맞춤, F 차 따라가기, H 전체. 창이 가려져도 멈추지 않는다(`runInBackground`: 멈추면 fleetd가 5초 쓰기 제한으로 닫는다).
 - **명령줄:** `-api`, `-floorHeight`(기본 5 m: 낮은 카메라에서 층이 겹쳐 보이지 않게 실제보다 높게), `-follow`, `-focus F`, `-yaw`/`-pitch`/`-distance`,
   `-capture <dir> -captureMs n -captureSeconds n [-captureQuit]`, 창 크기는 Unity의 `-screen-width`/`-screen-height`.

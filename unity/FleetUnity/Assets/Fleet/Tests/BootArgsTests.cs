@@ -38,6 +38,26 @@ namespace Fleet.Tests
         }
 
         [Test]
+        public void RideOptions()
+        {
+            var d = BootArgs.Parse(new[] { "x" });
+            Assert.IsTrue(d.CanRide, "Unity robots ride by default");
+            Assert.IsNull(d.ExitFailFloor);
+            Assert.AreEqual(30.0, d.MoveTimeoutExtra);
+            var a = BootArgs.Parse(new[] { "x", "-canRide", "false", "-exitFailFloor", "3", "-exitFailCount", "1",
+                "-doorMoveS", "2.5", "-ignoreTurns", "unity_1:2,unity_2", "-moveTimeoutExtra", "5" });
+            Assert.IsFalse(a.CanRide);
+            Assert.AreEqual(3, a.ExitFailFloor);
+            Assert.AreEqual(1, a.ExitFailCount);
+            Assert.AreEqual(2.5, a.DoorMoveS);
+            Assert.AreEqual(2, a.IgnoreTurns["unity_1"]);
+            Assert.AreEqual(1, a.IgnoreTurns["unity_2"]);
+            Assert.AreEqual(5.0, a.MoveTimeoutExtra);
+            Assert.IsEmpty(a.Warnings);
+            Assert.AreEqual(1, BootArgs.Parse(new[] { "-canRide", "maybe" }).Warnings.Count);
+        }
+
+        [Test]
         public void BadValueKeepsDefaultAndWarns()
         {
             var a = BootArgs.Parse(new[] { "-robots", "many", "-speed" });
