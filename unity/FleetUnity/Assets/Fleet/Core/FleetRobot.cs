@@ -1,8 +1,13 @@
 // One robot's side of the fleet protocol (docs/ROBOT_PROTOCOL.md): what
 // fleet_adapter.py does for a ROS robot, done by the robot itself. Pure: the
 // caller passes the clocks in and sends the returned messages in order.
-//   now  - monotonic seconds, for the publish policies
+//   now  - monotonic seconds, for the publish policies and the ride timers
 //   wall - unix seconds, for "stamp" and expires_at
+// Elevator rides (docs/ELEVATOR.md) are RobotRide; this class wires it the
+// way fleet_adapter.py does (handle_cmd, handle_elevator, tick_rides, run,
+// send_fleet): the blackout (no fleet/* while Ride.Silent, received commands
+// dropped before they are even parsed), the forced pose/state on link-return,
+// and the elevator moves, which go straight to RobotSim instead of a ROS topic.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -17,9 +22,13 @@ namespace Fleet.Core
         public readonly string Host;   // must equal the <host> of fleet/adapter/<host>/status (LWT match)
         public readonly string Boot;   // new per process: fleetd then accepts a seq that starts over
         public readonly RobotSim Sim;
+        public readonly RobotRide Ride;
         public string Frame = "map";
         // false sends "battery": null; fleetd's battery policy then skips the robot.
         public bool ReportBattery = true;
+        // false: every state says "can_ride": false and a "ride" fails, so fleetd
+        // never gives the robot a task with a waypoint on another floor.
+        public bool CanRide = true;
         public Action<string> Log = _ => { };
 
         readonly CommandBook book = new CommandBook();
@@ -27,10 +36,16 @@ namespace Fleet.Core
         ulong poseSeq, stateSeq;
         PoseSent? lastPose;
         StateSent? lastState;
+        double lastWall;               // RobotRide's clock for stamps: the wall time of the current call
+        bool wasSilent;
 
-        public FleetRobot(string name, string host, RobotSim sim, string boot = null)
+        public FleetRobot(string name, string host, RobotSim sim, string boot = null, int ignoreTurns = 0,
+                          double moveExtra = RobotRide.MoveExtraS)
         {
             Name = name; Host = host; Sim = sim; Boot = boot ?? Ids.NewBoot();
+            lastWall = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+            // Move ids unique per run, like the adapter's random move_base.
+            Ride = new RobotRide(name, Boot, () => lastWall, ignoreTurns, new Random().Next(1 << 30), moveExtra);
         }
 
         public string TaskId => activeGoto ?? "";
@@ -48,6 +63,15 @@ namespace Fleet.Core
 
         public void HandleCommand(string payload, double now, double wall, List<Outgoing> outq)
         {
+            lastWall = wall;
+            if (Ride.Silent)
+            {
+                // In the car: Wi-Fi does not reach the robot, so it never gets this
+                // (fleet_adapter.handle_cmd). Dropped before the CommandBook, or the
+                // server's re-send after the link is back would look like a duplicate.
+                Log($"{Name}: no link (in the elevator), command dropped: {Trunc(payload, 80)}");
+                return;
+            }
             JObject cmd;
             string cmdId, kind;
             double? expiresAt;
@@ -82,6 +106,22 @@ namespace Fleet.Core
                     return;
             }
 
+            if (kind == "cancel" && CanRide)
+            {
+                // A cancel for the ride, or any cancel while holding one, is the ride's business.
+                var acts = Ride.Cancel(cmdId, cmd["target"]?.Type == JTokenType.String ? (string)cmd["target"] : null);
+                if (acts != null)
+                {
+                    Run(acts, now, wall, outq);
+                    return;
+                }
+            }
+            if ((kind == "goto" || kind == "dock") && Ride.Holding)
+            {
+                Ack(outq, cmdId, "failed", $"holding ride {Ride.CmdId}");
+                return;
+            }
+
             switch (kind)
             {
                 case "goto": DoGoto(cmd, cmdId, outq); break;
@@ -91,11 +131,31 @@ namespace Fleet.Core
                     var why = Sim.ResetError();
                     Ack(outq, cmdId, why == null ? "accepted" : "failed", why ?? "reset");
                     break;
+                case "rescue":
+                    // A human takes the robot out of the car (the mock's rescue service).
+                    var no = Sim.Rescue();
+                    Ack(outq, cmdId, no == null ? "accepted" : "failed", no ?? $"taken out at floor {Sim.Floor}");
+                    break;
+                case "ride":
+                    if (CanRide) DoRide(cmd, cmdId, now, wall, outq);
+                    else Ack(outq, cmdId, "failed", "this robot cannot ride elevators (can_ride false)");
+                    break;
                 default:
-                    // Includes "ride": this robot sends can_ride:false and cannot ride.
                     Ack(outq, cmdId, "failed", $"unknown command type '{kind}'");
                     break;
             }
+        }
+
+        void DoRide(JObject cmd, string cmdId, double now, double wall, List<Outgoing> outq)
+        {
+            var acts = Ride.Accept(cmdId, cmd["ride"] as JObject, RideState(), new Spot(Sim.X, Sim.Y), now);
+            if (Ride.CmdId == cmdId && activeGoto != null)
+            {
+                // A goto still running: stop the robot; its ack goes before the ride's "accepted".
+                Sim.Stop();
+                EndGoto(outq, "cancelled", $"replaced by ride {cmdId}");
+            }
+            Run(acts, now, wall, outq);
         }
 
         void DoGoto(JObject cmd, string cmdId, List<Outgoing> outq)
@@ -169,20 +229,86 @@ namespace Fleet.Core
             Ack(outq, id, status, message);
         }
 
-        void Ack(List<Outgoing> outq, string cmdId, string status, string message)
+        void Ack(List<Outgoing> outq, string cmdId, string status, string message, int? floor = null)
         {
             var body = new JObject { ["cmd_id"] = cmdId, ["status"] = status, ["message"] = message };
+            if (floor.HasValue) body["floor"] = floor.Value;
             var json = body.ToString(Formatting.None);
             book.Record(cmdId, json);
+            Log($"{Name}: {cmdId} {status} {message}{(floor.HasValue ? $" (floor {floor})" : "")}");
+            if (Ride.Silent) return; // recorded, but no link to send it (fleet_adapter.send_fleet)
             outq.Add(new Outgoing(Topics.CmdAck(Name), json, 1));
-            Log($"{Name}: {cmdId} {status} {message}");
+        }
+
+        // ---------------------------------------------------------------- elevator channel
+
+        /// <summary>A message on elevator/&lt;car&gt;/turn|state|trip (fleet_adapter.handle_elevator).
+        /// msg is null for a cleared retained trip. Only a robot riding that car reacts.</summary>
+        public void HandleElevator(string car, string kind, JObject msg, double now, double wall, List<Outgoing> outq)
+        {
+            lastWall = wall;
+            if (!CanRide || string.IsNullOrEmpty(car) || Ride.Elevator != car) return;
+            switch (kind)
+            {
+                case "turn": if (msg != null) Run(Ride.Turn(msg, now), now, wall, outq); break;
+                case "state": if (msg != null) Run(Ride.CarState(msg), now, wall, outq); break;
+                // Only its end matters: robots never move on the retained trip's turn.
+                case "trip": Run(Ride.TripMsg(msg, now), now, wall, outq); break;
+            }
+        }
+
+        RideRobotState RideState() => new RideRobotState
+        {
+            Mode = Sim.Mode, Error = Sim.Error, Floor = Sim.Floor, InCar = Sim.InCar, Move = Sim.LastMove,
+        };
+
+        /// <summary>Carries out RobotRide actions, in order (fleet_adapter.run).</summary>
+        void Run(List<RideAction> actions, double now, double wall, List<Outgoing> outq)
+        {
+            foreach (var a in actions)
+            {
+                switch (a.Kind)
+                {
+                    case RideKind.Ack:
+                        Ack(outq, a.CmdId, a.Status, a.Message, a.Floor);
+                        break;
+                    case RideKind.State:
+                        PublishState(now, wall, outq, true, a.Override);
+                        break;
+                    case RideKind.Pose:
+                        PublishPose(now, wall, outq, true);
+                        break;
+                    case RideKind.Event:
+                        // RobotRide queues events itself while there is no link; the ones it
+                        // hands out go now (the "boarding" event goes with the last state).
+                        outq.Add(new Outgoing(Topics.Event(Name), a.Body.ToString(Formatting.None), 1));
+                        break;
+                    case RideKind.Zone:
+                        outq.Add(new Outgoing(Topics.Zone(a.Car), a.Body.ToString(Formatting.None), 1));
+                        Log($"{Name}: zone n={a.Body["n"]} {a.Body["action"]} {a.Body["event"]} floor {a.Body["floor"]}");
+                        break;
+                    case RideKind.Move:
+                        Sim.StartMove(a.Move);
+                        break;
+                }
+            }
+            if (Ride.Silent != wasSilent)
+            {
+                wasSilent = Ride.Silent;
+                Log($"{Name}: Wi-Fi {(Ride.Silent ? "lost (in the elevator)" : "back")}");
+            }
         }
 
         // ---------------------------------------------------------------- simulation + publishing
 
         public void Tick(double dt, double now, double wall, List<Outgoing> outq)
         {
+            lastWall = wall;
             Sim.Step(dt);
+            // The robot's report of its elevator move (fleet_adapter RobotBridge.on_state).
+            var mv = Sim.LastMove;
+            if (mv != null && Ride.Moving)
+                Run(Ride.MoveResult(mv.Id, mv.Status, mv.Detail, now), now, wall, outq);
             if (activeGoto != null)
             {
                 if (Sim.Mode == Modes.Error)
@@ -190,32 +316,47 @@ namespace Fleet.Core
                 else if (!Sim.HasGoal && Sim.Mode == Modes.Idle)
                     EndGoto(outq, "done", "");
             }
+            // fleet_adapter.tick_rides; the robot is always live here (same process).
+            if (Ride.Holding || Ride.Stranded != "")
+                Run(Ride.Tick(now, Sim.Floor, RideState()), now, wall, outq);
             PublishState(now, wall, outq);
             PublishPose(now, wall, outq);
         }
 
-        void PublishState(double now, double wall, List<Outgoing> outq)
+        /// <summary>fleet_adapter.publish_state. over is sent even in the blackout:
+        /// it is the last state before the link goes (BOARDING with silence_s).
+        /// force skips the 1 s policy (the state goes now) but still resets it.</summary>
+        void PublishState(double now, double wall, List<Outgoing> outq, bool force = false, RideOverlay over = null)
         {
-            // Same key as the adapter: a change of mode, error or task_id goes out at once.
-            var key = $"{Sim.Mode}|{Sim.Error}|{TaskId}|0";
-            if (!Throttle.StateDue(lastState, now, key))
+            if (Ride.Silent && over == null)
+                return;
+            var ov = over ?? Ride.Overlay(RideState());
+            string mode = ov?.Mode ?? Sim.Mode;
+            string taskId = ov != null ? ov.TaskId ?? "" : TaskId;
+            double silence = ov?.SilenceS ?? 0;
+            string error = ov?.Error ?? Sim.Error;
+            // Same key as the adapter: a change of mode, error, task_id or silence_s goes out at once.
+            var key = $"{mode}|{error}|{taskId}|{silence.ToString(CultureInfo.InvariantCulture)}";
+            if (!force && !Throttle.StateDue(lastState, now, key))
                 return;
             stateSeq++;
             lastState = new StateSent(now, key);
             var s = new JObject
             {
                 ["boot"] = Boot, ["seq"] = stateSeq, ["stamp"] = Math.Round(wall, 3), ["host"] = Host,
-                ["mode"] = Sim.Mode,
+                ["mode"] = mode,
                 ["battery"] = ReportBattery ? (JToken)Math.Round(Sim.Battery, 1) : JValue.CreateNull(),
-                ["task_id"] = TaskId, ["error"] = Sim.Error, ["silence_s"] = 0,
-                ["can_ride"] = false,
+                ["task_id"] = taskId, ["error"] = error, ["silence_s"] = silence,
+                ["can_ride"] = CanRide,
             };
             outq.Add(new Outgoing(Topics.State(Name), s.ToString(Formatting.None), 1));
         }
 
-        void PublishPose(double now, double wall, List<Outgoing> outq)
+        void PublishPose(double now, double wall, List<Outgoing> outq, bool force = false)
         {
-            if (!Throttle.PoseDueRated(lastPose, now, Sim.X, Sim.Y, Sim.Yaw))
+            if (Ride.Silent)
+                return;
+            if (!force && !Throttle.PoseDueRated(lastPose, now, Sim.X, Sim.Y, Sim.Yaw))
                 return;
             poseSeq++;
             lastPose = new PoseSent(now, Sim.X, Sim.Y, Sim.Yaw);
@@ -244,6 +385,6 @@ namespace Fleet.Core
         static double? OptNumber(JToken t) =>
             t == null || t.Type == JTokenType.Null ? (double?)null : Number(t);
 
-        static string Trunc(string s) => s.Length <= 120 ? s : s.Substring(0, 120);
+        static string Trunc(string s, int n = 120) => s.Length <= n ? s : s.Substring(0, n);
     }
 }

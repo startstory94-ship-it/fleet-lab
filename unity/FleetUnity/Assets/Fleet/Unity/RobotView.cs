@@ -55,18 +55,19 @@ namespace Fleet.UnityApp
         public void Sync()
         {
             var s = robot.Sim;
+            var mode = robot.Ride.Overlay()?.Mode ?? s.Mode;
             transform.localPosition = new Vector3((float)s.X, 0, (float)s.Y);
             // Fleet yaw is counter-clockwise from +x; Unity's Y rotation is clockwise from +z.
             transform.localRotation = Quaternion.Euler(0, 90f - (float)(s.Yaw * Mathf.Rad2Deg), 0);
-            if (shownMode != s.Mode)
+            if (shownMode != mode)
             {
-                shownMode = s.Mode;
-                body.material.color = ColorOf(s.Mode);
+                shownMode = mode;
+                body.material.color = ColorOf(mode);
             }
             if (label != null)
             {
                 label.transform.rotation = Quaternion.Euler(90, 0, 0);
-                label.text = $"{robot.Name}\n{s.Mode} {s.Battery:F0}%";
+                label.text = $"{robot.Name} F{s.Floor}\n{mode} {s.Battery:F0}%";
             }
         }
 
@@ -78,6 +79,10 @@ namespace Fleet.UnityApp
                 case Modes.Docking: return new Color(0.9f, 0.7f, 0.2f);
                 case Modes.Charging: return new Color(0.3f, 0.8f, 0.3f);
                 case Modes.Error: return new Color(0.9f, 0.2f, 0.2f);
+                case Modes.WaitingElevator:
+                case Modes.Boarding:
+                case Modes.Riding:
+                case Modes.Exiting: return new Color(0.6f, 0.35f, 0.85f); // purple, as the dashboards draw riders
                 default: return new Color(0.75f, 0.75f, 0.75f);
             }
         }

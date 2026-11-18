@@ -2,7 +2,10 @@
 // (fleet/adapter/<host>/status), like fleet_adapter.py's paho client:
 // retained "online" on every connect, retained "offline" as LWT and on a clean
 // quit, 5 s keepalive, reconnect with jittered back-off, re-subscribe after
-// each reconnect. MQTTnet runs on thread-pool threads; incoming messages go
+// each reconnect. Robots that can ride also follow elevator/+/turn|state|trip
+// (wildcards: one subscription serves every robot of the process and every
+// car; FleetBootstrap routes each message to the robots riding that car).
+// MQTTnet runs on thread-pool threads; incoming messages go
 // to an inbox the main thread drains, and outgoing ones leave through one
 // sender task so acks and seq keep their order.
 using System;
@@ -37,13 +40,15 @@ namespace Fleet.UnityApp
         int connects;        // bumped on each successful connect; the main thread re-publishes on change
         int dropped;
 
-        public FleetMqtt(string brokerHost, int brokerPort, string host, IEnumerable<string> robots)
+        public FleetMqtt(string brokerHost, int brokerPort, string host, IEnumerable<string> robots,
+                         IEnumerable<string> extraTopics = null)
         {
             this.brokerHost = brokerHost;
             this.brokerPort = brokerPort;
             Host = host;
             var topics = new List<string>();
             foreach (var r in robots) topics.Add(Topics.Cmd(r));
+            if (extraTopics != null) topics.AddRange(extraTopics);
             cmdTopics = topics.ToArray();
 
             client = new MqttFactory().CreateMqttClient();
@@ -124,7 +129,7 @@ namespace Fleet.UnityApp
                             sub.WithTopicFilter(t, MqttQualityOfServiceLevel.AtLeastOnce);
                         await client.SubscribeAsync(sub.Build(), stop.Token);
                         Interlocked.Increment(ref connects);
-                        Log($"mqtt connected to {brokerHost}:{brokerPort} as host {Host} (boot {Boot}), {cmdTopics.Length} robots");
+                        Log($"mqtt connected to {brokerHost}:{brokerPort} as host {Host} (boot {Boot}), {string.Join(", ", cmdTopics)}");
                         delay = 0.5 + rng.NextDouble();
                     }
                     catch (OperationCanceledException) when (stop.IsCancellationRequested)

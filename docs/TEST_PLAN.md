@@ -370,21 +370,23 @@ sim 쪽에서 처음 살아남은 2개(문 구역 확인 없이 turn, turn 재�
 | 실제 화면 (캡처 PNG를 직접 확인) | ✅ 수동 | 혼합 탑승: 칸별 로봇과 내릴 층, 층 사이 차, 4층 문 열림(초록)·하차. STALE(프로세스 멈춤)·OFFLINE(종료), CHARGING, 구독자 64개 꽉 참 → "server full (503)" 뒤 재연결, fleetd 멈춤 → 5초 뒤 재연결 |
 | 안 한 것 | — | 마우스 조작 실제로 안 눌러 봄(`-follow`·`-focus`만), ERROR 색은 테스트로만, WebGL 없음, CI에서 Unity 안 돎 |
 
-**8a·8b 리뷰:** 별도 리뷰는 아직 없다. 서브에이전트 결과를 diff·테스트·실제 실행으로 다시 확인했다(8c 뒤 함께 리뷰).
+**8a·8b 리뷰:** 별도 리뷰는 아직 없다. 서브에이전트 결과를 diff·테스트·실제 실행으로 다시 확인했다(8c와 함께 리뷰할 차례).
 
-### 8c: Unity 로봇 엘리베이터 탑승 + 대시보드 보정 (진행 중)
+### 8c: Unity 로봇 엘리베이터 탑승 + 대시보드 보정
 
-| 테스트 | 상태 | 확인할 것 |
+| 테스트 | 상태 | 리뷰 |
 |---|---|---|
-| 탑승 로직 (EditMode, `adapter/test_ride_logic.py` 34개를 옮김) | ⏳ | 수락 조건, 대기 중 새 ride, `cancel.target`, 탑승 turn의 순서(이벤트 → `BOARDING`+`silence_s` → `enter` → 이동), 같은 `n`은 같은 답, 이미 한 일의 새 `n`은 `clear`, 움직이는 중 turn 무시, 차 층 따라가기, 하차는 turn의 로비로, 1초 뒤 `pose` → `state` → 이벤트(seq 순) → `done`(+층), 하차 실패면 칸에서 기다림, 움직임 시간 초과, 운행이 로봇을 태운 채 끝남 → ERROR, 꺼냄 → `rescued` |
-| 로봇별 끊김 (EditMode, Unity 전용) | ⏳ | 한 프로세스의 로봇 하나가 끊긴 동안 그 로봇의 `fleet/*`만 0개, 다른 로봇은 계속 보냄, 끊긴 로봇이 받은 명령은 버림 |
-| Unity 로봇만 탑승 (실제 실행) | ⏳ | Unity 2대 → 3·5층: 둘 다 DONE·올바른 층, `elevator/E1/state`의 `door_zone` 최대 1, 차 안에서 `fleet/*` 0개 |
-| **ROS·Unity 함께 탑승** (실제 실행) | ⏳ | ROS 2대 + Unity 2대, 다른 층 작업 4개: `GET /elevators` 운행에 두 종류가 섞임, 계획대로 탑승 순서, 각자 층에서 하차, `door_zone` 최대 1 |
-| 하차 막힘 (실제 실행) | ⏳ | Unity 로봇 하차를 한 번 막음 → 재시도 → 다음 층 이월(ELEVATOR.md 6장), 작업 결과가 문서대로 |
-| 대시보드 보정 | ⏳ | 칸 자리 ↔ 보고된 위치 전환, 층 바뀜에서 약 0.6초 이어서 옮김, 처음 나타나는 로봇은 바로 그림. 로직이 있으면 EditMode 테스트 |
-| 회귀 | ⏳ | 기존 EditMode 79개, `mixed_fleet_check.py`(다른 층 작업도 Unity가 받을 수 있게 고침), e2e 71/71, `go test ./...`, 두 플레이어 빌드·실행 |
-| 데모 영상 | ⏳ | ROS·Unity가 한 차에 타는 3D 대시보드 영상, 타고 내릴 때 튀지 않음 |
-| 리뷰 | ⏳ | 8a~8c를 함께 리뷰(Codex 한도면 Claude 서브에이전트), 찾은 문제는 회귀 테스트와 함께 고침 |
+| 탑승 로직 (EditMode `RobotRideTests`, `adapter/test_ride_logic.py` 34개를 옮김) | ✅ 43개 | 파이썬 34개(파라미터 경우를 펼침) + 빈 계획. `Core/RobotRide.cs`는 `fleet_logic.py:174-546`을 옮겼고 주석에 줄 범위 |
+| 로봇별 끊김·배선 (EditMode `FleetRobotRideTests`) | ✅ 13개 | 한 로봇이 끊긴 동안 그 로봇의 `fleet/*`만 0개(BOARDING 상태·이벤트 제외)·다른 로봇은 계속, 끊긴 동안 받은 명령은 버리고 복귀 뒤 같은 명령은 새것으로, 복귀 순서, 문 구역 시점, 하차 막힘, 갇힘 → 꺼냄, 문 구역에서 고장, `can_ride` false, 토픽 읽기, 움직임 |
+| 대시보드 보정 (EditMode `MarkerTweenTests`) | ✅ 6개 | 칸 자리 ↔ 보고된 위치, 층 바뀜에서 0.6초 이어서 옮김, 처음 나타나면 바로 그림. 실제 캡처에서 탑승 로봇이 200 ms 세 칸에 걸쳐 칸으로 들어감 |
+| EditMode 전체 | ✅ 142/142 | 기존 79 + 새 63(옛 테스트 2개는 `can_ride` false를 단언해 고쳐 씀) |
+| Unity 로봇만 탑승 | ✅ 수동 | `unity_1` → 3층, `unity_2` → 5층 둘 다 DONE, 운행 `E1-ng2vvj-1` 탑승 순서가 계획(unity_2, unity_1)대로, `door_zone` 최대 1, 차 안에서 `fleet/*` 0개(첫 메시지는 하차 `clear` 약 1.0초 뒤) |
+| **ROS·Unity 함께 탑승** | ✅ 수동 2회 | 1회(서브에이전트): 운행 `E1-e7gnwo-1`에 unity_1(칸 2)·robot_1(칸 1)·robot_2(칸 0). 2회(직접, 영상 촬영): 운행 `E1-sw7yyk-1`에 unity_2(칸 2, 4층)·robot_2(칸 1, 3층)·robot_1(칸 0, 2층)이 계획 순서대로 탑승·각자 층에 하차, unity_1(5층)은 칸이 3개라 다음 운행. 작업 4개 DONE |
+| 하차 막힘 | ✅ 수동 | 한 번 막힘: 3층 하차 `failed`("door zone blocked") → 같은 층 재시도로 DONE. 두 번 막힘: 5층으로 넘겨져 문 쪽이라 먼저 내림 → ride `done` 5층 → 다시 내려가는 운행으로 3층 DONE(ELEVATOR.md 6장대로) |
+| 혼합 검증 스크립트 | ✅ PASS 2가지 | 기본: 다른 층 작업을 Unity도 받음(`unity_2` 5층). `--unity-no-ride`(`-canRide false`): ROS만 탐 |
+| 회귀 | ✅ | e2e 71/71, 두 플레이어 빌드·실행. fleetd·어댑터·mock·2D 대시보드는 바꾸지 않음 |
+| 데모 영상 | ✅ | 함께 타는 3D 대시보드 영상(약 2배속, 51초) |
+| 리뷰 | ⏳ | 8a~8c를 함께 리뷰할 차례 |
 
 ## 리뷰에서 찾은 문제
 

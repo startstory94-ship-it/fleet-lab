@@ -8,6 +8,7 @@ fleetd에 로봇을 붙이는 두 가지 방법이 있다.
 
 fleetd는 두 종류를 구분하지 않는다. 같은 토픽에 같은 JSON이 오면 같은 로봇이다. 이 문서는 **엘리베이터를 타지 않는** 로봇에게 필요한 전부를 적는다.
 엘리베이터 탑승(`ride` 명령, `elevator/<id>/*` 채널, `fleet/<robot>/event`)은 [ELEVATOR.md](ELEVATOR.md)에 있다.
+Unity 로봇도 ROS mock 로봇과 똑같이 엘리베이터를 탄다. ROS 로봇과 Unity 로봇이 한 차에 함께 탈 수 있다(9.1절).
 
 이 문서는 코드에서 옮겨 적었다. 규칙마다 근거를 `파일:줄`로 단다. 코드와 이 문서가 다르면 코드가 기준이다.
 `internal/` 줄 번호는 2026-11-18 작업 트리 기준이다(그 시점에 `can_ride` 변경이 커밋 전 상태로 들어와 있었다). 줄이 밀렸으면 함수 이름으로 찾는다.
@@ -83,7 +84,7 @@ fleetd는 두 종류를 구분하지 않는다. 같은 토픽에 같은 JSON이 
 
 ```json
 {"boot":"a470931a","seq":17,"stamp":1794989140.533,"host":"unity-1",
- "mode":"MOVING","battery":87.4,"task_id":"t-2.0.1.oywypl","error":"","silence_s":0,"can_ride":false}
+ "mode":"MOVING","battery":87.4,"task_id":"t-2.0.1.oywypl","error":"","silence_s":0,"can_ride":true}
 ```
 
 | 필드 | 타입 | 뜻 / 제한 | 근거 |
@@ -201,7 +202,8 @@ fleetd는 cancel의 ack를 쓰지 않으므로(`internal/task/manager.go:307-311
 ### 4.7 그 밖의 type
 
 어댑터는 `reset_error`, `drop_comms`, `rescue`(서비스 호출)도 받는다(`adapter/fleet_adapter.py:67`, `adapter/fleet_adapter.py:407-413`). fleetd는 이것들을 보내지 않는다(운영·시험용).
-모르는 type은 `failed` `"unknown command type '<type>'"`(`adapter/fleet_adapter.py:414-415`). 엘리베이터를 못 타는 로봇은 `ride`도 여기로 간다(8절).
+모르는 type은 `failed` `"unknown command type '<type>'"`(`adapter/fleet_adapter.py:414-415`). 엘리베이터를 못 타는 로봇은 `ride`를 `failed`로 거절한다(8절).
+Unity 로봇은 `reset_error`와 `rescue`(사람이 차에서 꺼냄, ELEVATOR.md 6장)를 받는다. `drop_comms`는 받지 않는다.
 
 ## 5. fleetd가 보는 것
 
@@ -254,7 +256,8 @@ fleetd는 mode가 바뀔 때마다 `mode` 이벤트를, error가 바뀔 때마�
 3. 명령: 중복이면 마지막 ack 반복 → 만료면 `failed`/`expired` → type별 처리(4.4~4.7절). goto의 끝은 `done`/`failed`/`cancelled` 중 하나, 앞선 goto가 밀려나면 `cancelled`.
 4. `task_id` = 몰고 있는 goto의 `cmd_id`, 그 밖에는 `""`.
 5. 배터리를 모르면 `null`. 알면 0..100으로 잘라 보낸다.
-6. 엘리베이터를 못 타면 모든 state에 `"can_ride": false`.
+6. 엘리베이터를 타면 ELEVATOR.md 5장 전부(`ride`, `elevator/<id>/turn|state|trip` 구독, `zone`, 끊김, `event`). Unity 로봇의 구현은 9.1절.
+   못 타면 모든 state에 `"can_ride": false`.
 7. 정상 종료: `offline`(retained)을 보내고 끊는다.
 
 ## 8. `can_ride` (선택, 엘리베이터를 못 타는 로봇)
@@ -267,9 +270,11 @@ fleetd는 mode가 바뀔 때마다 `mode` 이벤트를, error가 바뀔 때마�
   그런 작업은 탈 수 있는 로봇이 빌 때까지 대기열에 남는다(`internal/task/manager.go:562-564`). 엘리베이터가 하나도 설정되지 않았으면 이 제한은 없다(층이 다른 작업은 어차피 실패한다).
 - 배정 뒤에 false로 바뀐 경우도 막는다. 다른 층 구간을 준비할 때 그 로봇이 못 탄다고 하면, 작업 전체가 아니라 **그 로봇의 시도 하나만** 실패시키고 다른 로봇에 넘긴다
   (`internal/task/ride.go:69-72`, `internal/task/ride.go:84-95`).
-- 그래서 못 타는 로봇은 `ride` 명령을 받지 않는다. 그래도 오면 모르는 type처럼 `failed`로 답한다(4.7절).
+- 그래서 못 타는 로봇은 `ride` 명령을 받지 않는다. 그래도 오면 `failed`로 답한다(4.7절).
 
-Unity 로봇은 모든 state에 `"can_ride": false`를 보낸다.
+Unity 로봇은 기본으로 모든 state에 `"can_ride": true`를 보내고 엘리베이터를 탄다(9.1절).
+`-canRide false`(`unity_robots.ps1 -CanRide false`)로 띄우면 예전처럼 모든 state에 `"can_ride": false`를 보내고, `ride`는 `failed` `"this robot cannot ride elevators (can_ride false)"`로 거절하며
+엘리베이터 채널을 구독하지 않는다.
 
 ## 9. Unity 로봇 (`unity/FleetUnity`)
 
@@ -277,10 +282,10 @@ ROS 없이 이 문서대로 MQTT를 직접 말하는 시뮬레이터다. 한 Uni
 
 | 경로 | 내용 |
 |---|---|
-| `Assets/Fleet/Core` | 프로토콜 핵심. 순수 C#, UnityEngine 참조 없음(asmdef `noEngineReferences`). `fleet_logic.py`를 옮긴 것: `CommandBook`, 발행 정책(`Throttle`), 로봇 1대의 명령·ack·발행(`FleetRobot`), 운동·배터리(`RobotSim`, mock_fleet.py와 같은 값), 명령줄(`BootArgs`) |
-| `Assets/Fleet/Unity` | `FleetMqtt`(MQTTnet 4.3.7, 연결·LWT·재연결·inbox·송신 큐 하나), `FleetBootstrap`(로봇 생성, 매 프레임 core 구동, 시작 시 자동 생성), `RobotView`(원기둥 + 방향 표시, 바닥·카메라) |
+| `Assets/Fleet/Core` | 프로토콜 핵심. 순수 C#, UnityEngine 참조 없음(asmdef `noEngineReferences`). `fleet_logic.py`를 옮긴 것: `CommandBook`, 발행 정책(`Throttle`), 로봇 1대의 명령·ack·발행(`FleetRobot`), 엘리베이터 탑승(`RobotRide`, 9.1절), 운동·배터리·엘리베이터 움직임(`RobotSim`, mock_fleet.py와 같은 값), 명령줄(`BootArgs`) |
+| `Assets/Fleet/Unity` | `FleetMqtt`(MQTTnet 4.3.7, 연결·LWT·재연결·inbox·송신 큐 하나, `elevator/+/turn|state|trip` 구독), `FleetBootstrap`(로봇 생성, 매 프레임 core 구동, 엘리베이터 메시지를 그 차를 탄 로봇에게 전달, 시작 시 자동 생성), `RobotView`(원기둥 + 방향 표시, 바닥·카메라) |
 | `Assets/Fleet/Editor/BuildScript.cs` | `-executeMethod Fleet.EditorTools.BuildScript.BuildWindows` → `Build/FleetRobots.exe` (Mono, 스트리핑 끔) |
-| `Assets/Fleet/Tests` | EditMode 테스트(`adapter/test_fleet_logic.py`의 해당 사례 + ack 수명·cancel·dock·배터리) |
+| `Assets/Fleet/Tests` | EditMode 테스트(`adapter/test_fleet_logic.py`의 해당 사례 + ack 수명·cancel·dock·배터리, `adapter/test_ride_logic.py` 34개 사례를 옮긴 `RobotRideTests`, 로봇별 끊김·명령 버림·와이파이 복귀 순서·하차 실패·갇힘·`can_ride false`의 `FleetRobotRideTests`) |
 | `Assets/Plugins/MQTTnet/MQTTnet.dll` | nuget.org의 MQTTnet 4.3.7.1207 패키지 `lib/netstandard2.1` 그대로(MIT) |
 
 - 좌표: 지도 (x, y) = Unity (x, z). 위에서 보면 x는 오른쪽, y는 위. yaw는 +x에서 반시계.
@@ -298,3 +303,27 @@ powershell -ExecutionPolicy Bypass -File scripts\unity_robots.ps1 -Robots 2 -Hos
 ```
 
 로봇 이름은 `<prefix>_1..N`이다. 플레이어를 여러 개 띄울 때는 `-host`와 `-prefix`를 모두 다르게 준다.
+
+### 9.1 엘리베이터 탑승
+
+Unity 로봇은 [ELEVATOR.md](ELEVATOR.md) 5장을 ROS mock 로봇 + 어댑터와 **똑같이** 따른다. 엘리베이터 규약은 바뀌지 않았다. fleetd·mock 엘리베이터는 두 종류를 구분하지 않으므로
+ROS 로봇과 Unity 로봇이 한 운행(한 차)에 섞여 탄다. 탑승 순서·칸·`turn`·`zone`·`door_zone` 규칙도 같다.
+
+| 무엇 | Unity 쪽 | 원본 |
+|---|---|---|
+| 탑승 논리 | `Core/RobotRide.cs`: `RobotRide`를 동작 그대로 옮김(수락·검증·`WAITING_ELEVATOR`, `n` 중복과 답 다시 보내기, 움직이는 중 무응답, `BOARDING`+`silence_s`, 끊김, 와이파이 복귀 순서, 탑승 실패 → 로비, 하차 실패 → 자기 칸, 움직임 시간 제한, 로봇을 태운 채 끝난 운행 → ERROR "needs a human", 탑승 전 취소, 이벤트 seq). 메서드마다 원본 줄을 주석으로 단다 | `adapter/fleet_logic.py:174-546` |
+| 배선 | `Core/FleetRobot.cs`: 끊김 동안 `fleet/*` 발행 없음(예외: 탑승 직전 `BOARDING` 상태와 이벤트 액션), 받은 명령은 **파싱·중복 검사 전에** 버림, ack는 기록만, 복귀 때 pose·state를 정책 무시하고 바로 보냄, `ride` 수락이 진행 중 goto를 `cancelled`로 끝냄, ride를 든 동안 goto·dock 거절 | `adapter/fleet_adapter.py`의 `handle_cmd`, `run`, `send_fleet`, `tick_rides`, `publish_state/pose` |
+| 움직임 | `Core/RobotSim.cs`의 `StartMove`: `board`(로비 → 문 → 칸), `floor`(차 안일 때만 층 바꿈), `exit`(시작할 때 층을 F로, 칸 → 문 → 그 turn의 로비). 차 안 위치는 로비에서 +x로 문 +1.0 m, 칸 0 +1.8 m, 칸마다 +0.8 m. `in_car`는 움직임이 끝날 때만 바뀐다. 움직임 중 고장은 그 자리에 멈추고 `running`으로 남다가 `reset_error`가 시작점으로 되돌린 뒤 `failed` | `mock_robots/mock_fleet.py`의 `on_elevator_move`, `drive_move`, `on_reset_error`, `on_rescue` |
+| 문 구역 시각 | `zone enter`는 움직임을 시작하기 전 프레임에 나가고, `clear`는 칸(탈 때)이나 로비(내릴 때)에 닿은 뒤에 나간다 | ELEVATOR.md 3.10 |
+| MQTT | 연결 하나가 `fleet/<robot>/cmd`(로봇마다) + `elevator/+/turn`, `elevator/+/state`, `elevator/+/trip`(와일드카드, 재연결 때 다시)을 구독한다. 엘리베이터 메시지는 한 번 파싱해 그 차를 탄 로봇에게만 준다. 빈 retained `trip`은 "운행 끝"(지워짐), 객체가 아닌 본문은 무시. retained `trip`의 `turn`으로는 움직이지 않는다. 끊김은 로봇별이라 같은 프로세스의 다른 로봇은 계속 말한다 | `adapter/fleet_adapter.py`의 `subscribe_car`, `handle_elevator` |
+
+어댑터와 다른 점(규약에는 영향 없음): 로봇과 "어댑터"가 한 프로세스라 로봇은 항상 살아 있는 것으로 보고(어댑터의 `is_live`), 움직임 결과를 2 Hz `robot_state`가 아니라 매 프레임 읽는다.
+움직임 id는 실행마다 무작위 값에서 시작한다(어댑터의 `move_base`와 같다).
+
+실패 주입(시험용, mock 로봇·어댑터 플래그와 같은 뜻): `-exitFailFloor F [-exitFailCount N]`(F층 하차가 문 구역에서 막혀 칸으로 돌아감, 로봇마다 N번, -1은 매번),
+`-doorMoveS s`(탑승·하차가 최소 s초), `-ignoreTurns robot:n[,robot:n]`(자기 turn n개를 잃어버림), `-moveTimeoutExtra s`(기본 30).
+`unity_robots.ps1`에는 `-CanRide`, `-ExitFailFloor`, `-ExitFailCount`, `-DoorMoveS`, `-IgnoreTurns`로 있다.
+
+검증(2026-11-19, Mosquitto + fleetd + mock 엘리베이터): Unity 2대만 3·5층 / ROS 2대 + Unity 2대가 2·3·4·5층(한 운행에 `unity_1`·`robot_1`·`robot_2`) /
+Unity 하차 1번 막힘(같은 층 재시도로 내림)·2번 막힘(5층으로 넘겨져 내린 뒤 다시 3층으로) 모두 작업 DONE, `door_zone` 최대 1, 차 안 로봇의 `fleet/*` 0건,
+복귀 순서 pose → state → 이벤트 → `done`(+floor). `scripts/mixed_fleet_check.py`(기본: Unity도 다른 층 작업을 받음, `--unity-no-ride`: `-canRide false`로 띄운 Unity).

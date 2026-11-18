@@ -1,6 +1,12 @@
 // Command-line options of the robot player:
 //   -broker host:port -host id -robots N -prefix name -floor F
 //   -origin x,y -spacing m -speed m/s -battery %
+//   -canRide true|false       elevator rides (docs/ELEVATOR.md); false sends can_ride:false
+//   -exitFailFloor F [-exitFailCount N]   failure injection like mock_fleet.py:
+//                             exits on floor F fail (door zone blocked), N per robot (-1: every one)
+//   -doorMoveS s              every board/exit takes at least s seconds
+//   -ignoreTurns robot:n[,robot:n]  the robot misses its first n own turns (adapter --ignore-turns)
+//   -moveTimeoutExtra s       an unreported elevator move fails after turn_timeout_s + s (default 30)
 // Unknown arguments (Unity's own, e.g. -batchmode, -logFile) are skipped.
 using System;
 using System.Collections.Generic;
@@ -22,6 +28,12 @@ namespace Fleet.Core
         public double Spacing = 2.0;          // m between docks along x
         public double Speed = 0.8;            // m/s, the mock's default
         public double Battery = 100;          // start %, kept above fleetd's LowBattery by default
+        public bool CanRide = true;
+        public int? ExitFailFloor;
+        public int ExitFailCount = -1;
+        public double DoorMoveS;
+        public double MoveTimeoutExtra = RobotRide.MoveExtraS;
+        public readonly Dictionary<string, int> IgnoreTurns = new Dictionary<string, int>();
         public readonly List<string> Warnings = new List<string>();
 
         public string RobotName(int i) => $"{Prefix}_{i + 1}";
@@ -55,6 +67,23 @@ namespace Fleet.Core
                         case "-spacing": a.Spacing = D(Need(val)); break;
                         case "-speed": a.Speed = D(Need(val)); break;
                         case "-battery": a.Battery = Math.Max(0, Math.Min(100, D(Need(val)))); break;
+                        case "-canride":
+                            var v = Need(val).ToLowerInvariant();
+                            if (v == "true" || v == "1" || v == "yes") a.CanRide = true;
+                            else if (v == "false" || v == "0" || v == "no") a.CanRide = false;
+                            else throw new FormatException("not a bool");
+                            break;
+                        case "-exitfailfloor": a.ExitFailFloor = int.Parse(Need(val), CultureInfo.InvariantCulture); break;
+                        case "-exitfailcount": a.ExitFailCount = int.Parse(Need(val), CultureInfo.InvariantCulture); break;
+                        case "-doormoves": a.DoorMoveS = Math.Max(0, D(Need(val))); break;
+                        case "-movetimeoutextra": a.MoveTimeoutExtra = Math.Max(0, D(Need(val))); break;
+                        case "-ignoreturns":
+                            foreach (var spec in Need(val).Split(','))
+                            {
+                                var kv = spec.Split(':');
+                                a.IgnoreTurns[kv[0].Trim()] = kv.Length > 1 ? int.Parse(kv[1], CultureInfo.InvariantCulture) : 1;
+                            }
+                            break;
                         default: used = false; break;
                     }
                 }
