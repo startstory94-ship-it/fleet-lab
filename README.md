@@ -449,7 +449,9 @@ CI는 위의 Go·node·pytest를 돌리고(`go test`는 `-race`로), e2e는 ROS 
 
 ### 3D 대시보드 (Unity)
 
-![3D 대시보드: 목적층이 다른 로봇 3대가 엘리베이터로 2·3·4층에 내리고, 1층에는 Unity 로봇 2대가 있다](docs/demo3d.gif)
+![3D 대시보드: ROS 로봇 2대와 Unity 로봇 1대가 한 엘리베이터에 함께 타서 2·3·4층에 내리고, 남은 Unity 로봇은 다음 운행으로 5층에 간다](docs/demo3d.gif)
+
+ROS 로봇(robot_1·2, 어댑터 경유)과 Unity 로봇(unity_1·2, MQTT 직접)에게 2·3·4·5층 작업을 동시에 보낸 장면(약 4배속). 첫 운행에 robot_1(2층)·robot_2(3층)·unity_2(4층)가 함께 타고(칸이 3개), unity_1은 다음 운행으로 5층에 간다. 화면은 엘리베이터를 따라간다.
 
 `unity/FleetUnity`의 두 번째 플레이어. 층을 위로 쌓아 놓고 로봇 전체·엘리베이터 통로·움직이는 차·차 안 로봇을 한 화면에 보여 주는 **보기 전용** 화면이다.
 fleetd하고만 말하므로(`/ws/live`, `GET /elevators`·`/tasks`·`/events`) ROS 로봇과 Unity 로봇이 똑같이 보인다.
