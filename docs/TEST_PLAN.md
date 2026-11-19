@@ -394,7 +394,14 @@ sim 쪽에서 처음 살아남은 2개(문 구역 확인 없이 turn, turn 재�
 
 | # | 문제 | 수정 | 테스트 |
 |---|---|---|---|
-| 1 중 | MQTT가 끊긴 동안 Unity 로봇은 QoS 1도 버림. 하차 직후 와이파이 복귀와 MQTT 끊김이 겹치면 `boarded`·`exited` 이벤트를 영영 잃음. ROS 어댑터(paho)는 끊긴 동안의 QoS 1을 붙잡았다가 다시 연결되면 순서대로 보냄 | `Core/PendingQueue.cs`(순서 유지, 최대 1000개, 넘치면 가장 오래된 것을 버리고 셈). 끊긴 동안·발행 실패 뒤 QoS 1을 쌓고, "online" 발행과 구독이 끝난 뒤(`ready`) 새 메시지보다 먼저 보냄. QoS 0(pose)은 버림 | `PendingQueueTests` 6개: 순서·새것보다 먼저, QoS 0 버림, 한도, 실패한 발행은 맨 앞에 남고 멈춤, 실패한 QoS 0, 도중에 끊김. 실제 재연결 확인은 결론을 못 냄(새 구독자가 본 seq가 건너뜀): 단위 테스트에 기댐 |
+| 1 중 | MQTT가 끊긴 동안 Unity 로봇은 QoS 1도 버림. 하차 직후 와이파이 복귀와 MQTT 끊김이 겹치면 `boarded`·`exited` 이벤트를 영영 잃음. ROS 어댑터(paho)는 끊긴 동안의 QoS 1을 붙잡았다가 다시 연결되면 순서대로 보냄 | `Core/PendingQueue.cs`(순서 유지, 최대 1000개, 넘치면 가장 오래된 것을 버리고 셈). 끊긴 동안·발행 실패 뒤 QoS 1을 쌓고, "online" 발행과 구독이 끝난 뒤(`ready`) 새 메시지보다 먼저 보냄. QoS 0(pose)은 버림 | `PendingQueueTests` 6개: 순서·새것보다 먼저, QoS 0 버림, 한도, 실패한 발행은 맨 앞에 남고 멈춤, 실패한 QoS 0, 도중에 끊김. 실제 재연결 확인(2026-11-19, `scripts/unity_reconnect_check.py`, 아래) ✅ |
+
+**리뷰 1번 실제 재연결 확인 (2026-11-19).** Unity 로봇 1대의 MQTT만 TCP 프록시(18831 → 1883)를 거치게 하고, 하차 도중 로그를 보고 6초 동안 끊었다(fleetd·엘리베이터는 브로커에 그대로). 1층 → 3층 작업.
+
+| 끊은 시점 | 끊긴 동안 | 다시 연결된 뒤 브로커에 도착한 순서 | fleetd |
+|---|---|---|---|
+| `exit clear` 직후(와이파이 복귀 1초 전) | `unity_1`의 메시지 0개. 와이파이 복귀가 끊긴 상태에서 일어남 | "online" → `state`(seq 25, 복귀 시각) → `boarded` #3 → `exited` #4 → `done`(floor 3) → 쌓인 `state` 26~35 → `pose`(QoS 0은 끊긴 동안 버려 마지막) | 끊기자 "내린 뒤 OFFLINE"으로 작업을 재대기(시도 1회 사용), 재연결 뒤 `robot_event #3 boarded`, `#4 exited` 기록, 3층에서 다음 시도로 마무리 → DONE |
+| `exit enter` 직후(문 구역 안) | 메시지 0개. 엘리베이터는 하차 turn을 다시 보내며 기다림 | "online" → `zone exit clear` → `state` → `boarded` → `exited` → `done` → 쌓인 `state` | 운행 중 OFFLINE은 재대기하지 않음. 늦게 온 `clear`로 하차 처리, 같은 시도(`t-1.0.1`)로 DONE |
 | 2 중 | 문 구역에서 고장(ERROR)이 나면 움직임은 `running`, 끊김 유지, `reset_error`·`rescue` 명령은 차 안이라 버려짐 → 실행 중인 플레이어로는 풀 수 없음. ROS mock 로봇은 로컬 서비스(현장 사람)가 있음 | 운영자 토픽 `mockrobot/<robot>/operator`(`{"action":"reset_error"}` / `{"action":"rescue"}`), `fleet/*`이 아니므로 끊긴 동안에도 받음(mock 엘리베이터의 `mockelevator/<id>/fault`와 같은 성격). `fleet/*` 응답 없음. ROBOT_PROTOCOL.md 9.1에 적음 | `OperatorResetErrorUnblocksAFaultInTheDoorZoneDuringTheBlackout`, `OperatorRescueTakesARobotOutOfTheCarWhileRiding`, `OperatorRescueOfAStrandedRobotReportsRescued`, `OperatorMessagesThatDoNothingStaySilent` |
 | 3 낮 | 대시보드: 하차하면 `/elevators`는 곧 `out`인데 새 pose는 규약상 1초 뒤. 그 사이 탑승 전 층의 기록을 써서 마커가 출발 층 쪽으로 갔다가 하차 층으로 튐(8c 보정이 오히려 눈에 띄게 함) | 차에서 나온 로봇은 그 뒤의 pose가 올 때까지 마지막으로 그린 자리에 둠(최대 5초, 넘으면 기록 사용), 그 뒤 0.6초 보정으로 새 위치로 | `HeldAfterTheCarUntilANewerPoseThenTweensFromTheHeldPosition`, `HoldTimesOutAndFallsBackToTheTrack`, `BackInTheCarEndsTheHold`, `RobotThatWasNeverInACarIsNotHeld`. 실제 캡처에서 하차 뒤 1층 로비에 나타나지 않음 |
 
